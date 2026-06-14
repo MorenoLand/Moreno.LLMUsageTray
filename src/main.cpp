@@ -639,16 +639,27 @@ void draw_pin(Rect r, bool active) {
 void draw_refresh(Rect r, bool enabled) {
     button(r, "", enabled);
     SDL_Color c = enabled ? color(231, 238, 234) : color(115, 123, 119);
-    set_color(c.r, c.g, c.b, c.a);
-    float cx = r.x + r.w / 2.0f;
-    float cy = r.y + r.h / 2.0f;
-    float radius = 5.0f;
-    for (int i = 35; i < 315; i += 12) {
-        float a = static_cast<float>(i) * 3.14159265f / 180.0f;
-        SDL_RenderPoint(g_ui.renderer, cx + std::cos(a) * radius, cy + std::sin(a) * radius);
-    }
-    SDL_RenderLine(g_ui.renderer, cx + 4, cy - 7, cx + 8, cy - 7);
-    SDL_RenderLine(g_ui.renderer, cx + 8, cy - 7, cx + 8, cy - 3);
+    float s = 0.70f;
+    float ox = r.x + (r.w - 24.0f * s) / 2.0f;
+    float oy = r.y + (r.h - 24.0f * s) / 2.0f;
+    auto p = [&](float x, float y) { return SDL_FPoint{ox + x * s, oy + y * s}; };
+    auto line = [&](SDL_FPoint a, SDL_FPoint b) { thick_line(a, b, 2.1f, c); };
+
+    line(p(21, 2), p(21, 8));
+    line(p(21, 8), p(15, 8));
+    line(p(3, 22), p(3, 16));
+    line(p(3, 16), p(9, 16));
+
+    std::vector<SDL_FPoint> top = {
+        p(3, 12), p(4.0f, 8.6f), p(6.6f, 5.9f), p(10.2f, 4.6f),
+        p(14.0f, 4.6f), p(18.0f, 5.3f), p(21, 8)
+    };
+    std::vector<SDL_FPoint> bottom = {
+        p(21, 12), p(20.0f, 15.4f), p(17.4f, 18.1f), p(13.8f, 19.4f),
+        p(10.0f, 19.4f), p(6.0f, 18.7f), p(3, 16)
+    };
+    for (std::size_t i = 1; i < top.size(); ++i) line(top[i - 1], top[i]);
+    for (std::size_t i = 1; i < bottom.size(); ++i) line(bottom[i - 1], bottom[i]);
 }
 
 void draw_chevron(Rect r, bool open) {
@@ -998,7 +1009,8 @@ int main(int, char**) {
 
         if (g_ui.panel_height != g_ui.target_height) {
             int delta = g_ui.target_height - g_ui.panel_height;
-            g_ui.panel_height += std::abs(delta) <= 2 ? delta : std::max(1, std::abs(delta) / 5) * (delta > 0 ? 1 : -1);
+            int step = std::max(8, static_cast<int>(std::ceil(std::abs(delta) * 0.38f)));
+            g_ui.panel_height += std::abs(delta) <= step ? delta : step * (delta > 0 ? 1 : -1);
             SDL_SetWindowSize(g_ui.window, kPanelWidth, g_ui.panel_height);
             if (g_ui.anchor_bottom > 0) {
                 int wx = 0;
