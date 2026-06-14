@@ -7,7 +7,7 @@ Windows, macOS, and Linux.
 
 Implemented:
 
-- secure credential storage via DPAPI
+- secure credential storage through the Windows credential backend
 - HTTP via WinHTTP
 - browser launch via `ShellExecuteW`
 - OAuth localhost callback server via Winsock

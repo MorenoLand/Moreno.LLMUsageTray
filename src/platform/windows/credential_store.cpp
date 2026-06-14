@@ -15,7 +15,7 @@ static std::string storage_path_for(const std::string& name) {
     }
     std::string dir = std::string(appdata) + "\\LLMUsageTray";
     CreateDirectoryA(dir.c_str(), nullptr);
-    return dir + "\\" + name + ".dpapi";
+    return dir + "\\" + name + ".cred";
 }
 
 static std::string storage_path() {
@@ -50,13 +50,6 @@ std::optional<std::string> credential_load_named(const std::string& name) {
     std::vector<unsigned char> encrypted = read_file(storage_path_for(name));
     if (encrypted.empty() && name == "openai") {
         encrypted = read_file(storage_path_for("auth"));
-        if (encrypted.empty()) {
-            char appdata[MAX_PATH]{};
-            DWORD len = GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH);
-            if (len > 0 && len < MAX_PATH) {
-                encrypted = read_file(std::string(appdata) + "\\CodexUsageTray\\auth.dpapi");
-            }
-        }
     }
     if (encrypted.empty()) {
         return std::nullopt;
