@@ -164,12 +164,12 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         std::size_t spos = res.body.find("\"seven_day\"");
         std::string five = fpos == std::string::npos ? res.body : res.body.substr(fpos, spos == std::string::npos ? std::string::npos : spos - fpos);
         std::string seven = spos == std::string::npos ? res.body : res.body.substr(spos);
-        info.primary.used_percent = json_number(five, "used_percent").value_or(0);
-        if (auto n = json_number(five, "reset_at")) info.primary.reset_at = static_cast<long long>(*n);
-        else info.primary.reset_at = parse_iso_or_epoch_reset(json_string(five, "reset_at").value_or(""));
-        info.secondary.used_percent = json_number(seven, "used_percent").value_or(0);
-        if (auto n = json_number(seven, "reset_at")) info.secondary.reset_at = static_cast<long long>(*n);
-        else info.secondary.reset_at = parse_iso_or_epoch_reset(json_string(seven, "reset_at").value_or(""));
+        info.primary.used_percent = json_number(five, "utilization").value_or(0);
+        if (auto n = json_number(five, "resets_at")) info.primary.reset_at = static_cast<long long>(*n);
+        else info.primary.reset_at = parse_iso_or_epoch_reset(json_string(five, "resets_at").value_or(""));
+        info.secondary.used_percent = json_number(seven, "utilization").value_or(0);
+        if (auto n = json_number(seven, "resets_at")) info.secondary.reset_at = static_cast<long long>(*n);
+        else info.secondary.reset_at = parse_iso_or_epoch_reset(json_string(seven, "resets_at").value_or(""));
         return info;
     }
 
