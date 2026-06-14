@@ -1,0 +1,22 @@
+#pragma once
+
+#include <optional>
+#include <string>
+
+struct RateWindow {
+    double used_percent = 0;
+    long long reset_at = 0;
+};
+
+struct UsageInfo {
+    std::string email;
+    std::string plan_type;
+    RateWindow primary;
+    RateWindow secondary;
+};
+
+UsageInfo fetch_usage_with_auth();
+UsageInfo fetch_usage_with_auth_provider(const std::string& provider);
+void warm_provider(const std::string& provider);
+std::string format_usage_line(const char* label, const RateWindow& window);
+std::string format_reset(long long reset_at_seconds);

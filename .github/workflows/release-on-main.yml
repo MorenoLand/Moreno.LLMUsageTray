@@ -1,0 +1,186 @@
+name: Version And Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Bump Patch Version
+    runs-on: windows-2022
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]') }}
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Bump version
+        id: bump
+        shell: pwsh
+        run: |
+          $version = ./scripts/bump-version.ps1
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Commit version and tag
+        shell: pwsh
+        run: |
+          $version = "${{ steps.bump.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore: bump version to v$version [skip ci]"
+          git tag "v$version"
+          git push origin HEAD:main
+          git push origin "v$version"
+
+  windows:
+    name: Windows Release Build
+    runs-on: windows-2022
+    needs: version
+    if: ${{ needs.version.outputs.version != '' }}
+
+    steps:
+      - name: Checkout bumped tag
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --target LLMUsageTray
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/LLMUsageTray.exe dist/LLMUsageTray.exe
+          Compress-Archive -Path dist/LLMUsageTray.exe -DestinationPath "dist/LLMUsageTray-${{ needs.version.outputs.version }}-windows-x64.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LLMUsageTray-${{ needs.version.outputs.version }}-windows-x64
+          path: dist/LLMUsageTray-${{ needs.version.outputs.version }}-windows-x64.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS Release Build
+    runs-on: macos-latest
+    needs: version
+    if: ${{ needs.version.outputs.version != '' }}
+
+    steps:
+      - name: Checkout bumped tag
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --target LLMUsageTray
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/LLMUsageTray dist/LLMUsageTray
+          tar -czf "dist/LLMUsageTray-${{ needs.version.outputs.version }}-macos.tar.gz" -C dist LLMUsageTray
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LLMUsageTray-${{ needs.version.outputs.version }}-macos
+          path: dist/LLMUsageTray-${{ needs.version.outputs.version }}-macos.tar.gz
+          if-no-files-found: error
+
+  linux:
+    name: Linux Release Build
+    runs-on: ubuntu-latest
+    needs: version
+    if: ${{ needs.version.outputs.version != '' }}
+
+    steps:
+      - name: Checkout bumped tag
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - name: Install dependencies
+        run: >
+          sudo apt-get update &&
+          sudo apt-get install -y
+          libcurl4-openssl-dev
+          libsecret-tools
+          libx11-dev
+          libxext-dev
+          libxrandr-dev
+          libxcursor-dev
+          libxfixes-dev
+          libxtst-dev
+          libxi-dev
+          libxss-dev
+          libwayland-dev
+          libxkbcommon-dev
+          wayland-protocols
+          libdbus-1-dev
+          libudev-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --target LLMUsageTray
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/LLMUsageTray dist/LLMUsageTray
+          tar -czf "dist/LLMUsageTray-${{ needs.version.outputs.version }}-linux-x64.tar.gz" -C dist LLMUsageTray
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LLMUsageTray-${{ needs.version.outputs.version }}-linux-x64
+          path: dist/LLMUsageTray-${{ needs.version.outputs.version }}-linux-x64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - version
+      - windows
+      - macos
+      - linux
+    if: ${{ needs.version.outputs.version != '' }}
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "v${VERSION}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "LLM Usage Tray v${VERSION}" \
+            --notes "Automated build for Windows, macOS, and Linux."
