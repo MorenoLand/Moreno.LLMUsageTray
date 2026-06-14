@@ -73,7 +73,7 @@ struct UiState {
     double drawer_anim = 0.0;
     std::string api_key_input;
     Rect gpt_tab, claude_tab, glm_tab;
-    Rect pin_button, drawer_button;
+    Rect top_refresh_button, pin_button, drawer_button;
     Rect login_button, refresh_button, warm_button, logout_button, quit_button;
     Rect api_input, api_ok, api_cancel;
 };
@@ -148,7 +148,7 @@ bool over_click_target(float x, float y) {
         return contains(g_ui.api_input, x, y) || contains(g_ui.api_ok, x, y) || contains(g_ui.api_cancel, x, y);
     }
     if (contains(g_ui.gpt_tab, x, y) || contains(g_ui.claude_tab, x, y) || contains(g_ui.glm_tab, x, y)) return true;
-    if (contains(g_ui.pin_button, x, y) || contains(g_ui.drawer_button, x, y)) return true;
+    if (contains(g_ui.top_refresh_button, x, y) || contains(g_ui.pin_button, x, y) || contains(g_ui.drawer_button, x, y)) return true;
     if (!g_ui.drawer_open) return false;
     return contains(g_ui.login_button, x, y) || contains(g_ui.refresh_button, x, y) ||
         contains(g_ui.warm_button, x, y) || contains(g_ui.logout_button, x, y) ||
@@ -636,6 +636,21 @@ void draw_pin(Rect r, bool active) {
     pushpin_icon(r, active);
 }
 
+void draw_refresh(Rect r, bool enabled) {
+    button(r, "", enabled);
+    SDL_Color c = enabled ? color(231, 238, 234) : color(115, 123, 119);
+    set_color(c.r, c.g, c.b, c.a);
+    float cx = r.x + r.w / 2.0f;
+    float cy = r.y + r.h / 2.0f;
+    float radius = 5.0f;
+    for (int i = 35; i < 315; i += 12) {
+        float a = static_cast<float>(i) * 3.14159265f / 180.0f;
+        SDL_RenderPoint(g_ui.renderer, cx + std::cos(a) * radius, cy + std::sin(a) * radius);
+    }
+    SDL_RenderLine(g_ui.renderer, cx + 4, cy - 7, cx + 8, cy - 7);
+    SDL_RenderLine(g_ui.renderer, cx + 8, cy - 7, cx + 8, cy - 3);
+}
+
 void draw_chevron(Rect r, bool open) {
     button(r, "", true);
     set_color(231, 238, 234, 255);
@@ -681,8 +696,10 @@ void draw_panel() {
     tab(g_ui.claude_tab, "Claude", selected == 1);
     tab(g_ui.glm_tab, "GLM", selected == 2);
 
-    g_ui.pin_button = {270, 12, 24, 24};
-    g_ui.drawer_button = {300, 12, 24, 24};
+    g_ui.top_refresh_button = {230, 10, 30, 28};
+    g_ui.pin_button = {264, 10, 30, 28};
+    g_ui.drawer_button = {298, 10, 30, 28};
+    draw_refresh(g_ui.top_refresh_button, logged_in && !busy);
     draw_pin(g_ui.pin_button, g_ui.pinned);
     draw_chevron(g_ui.drawer_button, g_ui.drawer_open);
 
@@ -806,6 +823,8 @@ void handle_click(float x, float y) {
     if (contains(g_ui.gpt_tab, x, y) || contains(g_ui.claude_tab, x, y) || contains(g_ui.glm_tab, x, y)) {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         g_app.selected = contains(g_ui.glm_tab, x, y) ? 2 : (contains(g_ui.claude_tab, x, y) ? 1 : 0);
+    } else if (contains(g_ui.top_refresh_button, x, y) && !busy && logged_in) {
+        refresh_usage_async_for(selected, true);
     } else if (contains(g_ui.pin_button, x, y)) {
         g_ui.pinned = !g_ui.pinned;
     } else if (contains(g_ui.drawer_button, x, y)) {
