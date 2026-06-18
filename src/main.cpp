@@ -58,6 +58,10 @@ struct UiState {
     SDL_Surface* icon = nullptr;
     TTF_Font* font = nullptr;
     TTF_Font* font_bold = nullptr;
+    std::filesystem::path font_path;
+    std::filesystem::path font_bold_path;
+    float render_scale = 1.0f;
+    float font_scale = 0.0f;
     bool visible = false;
     bool pinned = false;
     bool drawer_open = false;
@@ -198,6 +202,41 @@ void update_window_shape() {
     SDL_DestroySurface(shape);
 }
 
+void close_fonts() {
+    if (g_ui.font_bold) {
+        TTF_CloseFont(g_ui.font_bold);
+        g_ui.font_bold = nullptr;
+    }
+    if (g_ui.font) {
+        TTF_CloseFont(g_ui.font);
+        g_ui.font = nullptr;
+    }
+}
+
+bool load_fonts_for_scale(float scale) {
+    close_fonts();
+    float point_size = std::max(14.0f, std::round(14.0f * scale));
+    g_ui.font = TTF_OpenFont(g_ui.font_path.string().c_str(), point_size);
+    g_ui.font_bold = TTF_OpenFont(g_ui.font_bold_path.string().c_str(), point_size);
+    g_ui.font_scale = scale;
+    return g_ui.font != nullptr;
+}
+
+void update_render_metrics(bool reload_fonts = true) {
+    if (!g_ui.window || !g_ui.renderer) return;
+    SDL_SetRenderLogicalPresentation(g_ui.renderer, kPanelWidth, g_ui.panel_height, SDL_LOGICAL_PRESENTATION_STRETCH);
+
+    int ww = 0, wh = 0, rw = 0, rh = 0;
+    SDL_GetWindowSize(g_ui.window, &ww, &wh);
+    SDL_GetRenderOutputSize(g_ui.renderer, &rw, &rh);
+    float sx = ww > 0 ? static_cast<float>(rw) / static_cast<float>(ww) : 1.0f;
+    float sy = wh > 0 ? static_cast<float>(rh) / static_cast<float>(wh) : sx;
+    g_ui.render_scale = std::max(1.0f, std::max(sx, sy));
+    if (reload_fonts && !g_ui.font_path.empty() && std::abs(g_ui.render_scale - g_ui.font_scale) > 0.05f) {
+        load_fonts_for_scale(g_ui.render_scale);
+    }
+}
+
 int wanted_panel_height() {
     if (g_ui.api_key_mode) return kPanelApiKeyHeight;
     return g_ui.drawer_open ? kPanelExpandedHeight : kPanelCollapsedHeight;
@@ -216,6 +255,7 @@ void set_target_height(int height, bool immediate = false) {
     if (!immediate) return;
     g_ui.panel_height = height;
     SDL_SetWindowSize(g_ui.window, kPanelWidth, g_ui.panel_height);
+    update_render_metrics();
     if (g_ui.anchor_bottom > 0) {
         int wx = 0;
         int wy = 0;
@@ -231,6 +271,7 @@ void show_panel() {
     g_ui.panel_height = wanted_panel_height();
     g_ui.target_height = g_ui.panel_height;
     SDL_SetWindowSize(g_ui.window, kPanelWidth, g_ui.panel_height);
+    update_render_metrics();
     float mx = 0, my = 0;
     SDL_GetGlobalMouseState(&mx, &my);
     g_ui.anchor_bottom = static_cast<int>(my) - 12;
@@ -481,7 +522,11 @@ std::pair<int, int> measure_text(const std::string& s, bool bold = false) {
     TTF_Font* font = pick_font(bold);
     if (!font || s.empty()) return {0, 0};
     TTF_GetStringSize(font, s.c_str(), s.size(), &w, &h);
-    return {w, h};
+    float scale = std::max(1.0f, g_ui.render_scale);
+    return {
+        static_cast<int>(std::ceil(static_cast<float>(w) / scale)),
+        static_cast<int>(std::ceil(static_cast<float>(h) / scale))
+    };
 }
 
 void text(float x, float y, const std::string& s, Uint8 r = 231, Uint8 g = 238, Uint8 b = 234, bool bold = false) {
@@ -492,7 +537,8 @@ void text(float x, float y, const std::string& s, Uint8 r = 231, Uint8 g = 238, 
     if (!surface) return;
     SDL_Texture* texture = SDL_CreateTextureFromSurface(g_ui.renderer, surface);
     if (texture) {
-        SDL_FRect dst{x, y, static_cast<float>(surface->w), static_cast<float>(surface->h)};
+        float scale = std::max(1.0f, g_ui.render_scale);
+        SDL_FRect dst{x, y, static_cast<float>(surface->w) / scale, static_cast<float>(surface->h) / scale};
         SDL_RenderTexture(g_ui.renderer, texture, nullptr, &dst);
         SDL_DestroyTexture(texture);
     }
@@ -939,9 +985,9 @@ bool init_fonts() {
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
     });
     if (!regular) return false;
-    g_ui.font = TTF_OpenFont(regular->string().c_str(), 14);
-    g_ui.font_bold = TTF_OpenFont((bold ? *bold : *regular).string().c_str(), 14);
-    return g_ui.font != nullptr;
+    g_ui.font_path = *regular;
+    g_ui.font_bold_path = bold ? *bold : *regular;
+    return load_fonts_for_scale(g_ui.render_scale);
 }
 
 } // namespace
@@ -957,12 +1003,14 @@ int main(int, char**) {
     SDL_SetAppMetadata("LLM Usage Tray", LLM_USAGE_TRAY_VERSION, "works.tward.llm-usage-tray");
 
     g_ui.window = SDL_CreateWindow("LLM Usage Tray", kPanelWidth, kPanelCollapsedHeight,
-        SDL_WINDOW_HIDDEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_TRANSPARENT | SDL_WINDOW_UTILITY);
+        SDL_WINDOW_HIDDEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP |
+        SDL_WINDOW_TRANSPARENT | SDL_WINDOW_UTILITY | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_ui.window) return 1;
     g_ui.renderer = SDL_CreateRenderer(g_ui.window, nullptr);
     if (!g_ui.renderer) return 1;
     SDL_SetRenderVSync(g_ui.renderer, 1);
     SDL_SetRenderDrawBlendMode(g_ui.renderer, SDL_BLENDMODE_BLEND);
+    update_render_metrics(false);
     if (!init_fonts()) return 1;
 
     init_state();
@@ -980,6 +1028,7 @@ int main(int, char**) {
             else if (event.type == SDL_EVENT_MOUSE_MOTION) handle_mouse_motion();
             else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) handle_mouse_up(event.button.x, event.button.y);
             else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) hide_panel();
+            else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) update_render_metrics();
             else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.api_key_mode && g_ui.api_input_focused) g_ui.api_key_input += event.text.text;
             else if (event.type == SDL_EVENT_KEY_DOWN && g_ui.api_key_mode) {
                 bool paste = ((event.key.mod & SDL_KMOD_CTRL) && event.key.key == SDLK_V) ||
@@ -1012,6 +1061,7 @@ int main(int, char**) {
             int step = std::max(8, static_cast<int>(std::ceil(std::abs(delta) * 0.38f)));
             g_ui.panel_height += std::abs(delta) <= step ? delta : step * (delta > 0 ? 1 : -1);
             SDL_SetWindowSize(g_ui.window, kPanelWidth, g_ui.panel_height);
+            update_render_metrics();
             if (g_ui.anchor_bottom > 0) {
                 int wx = 0;
                 int wy = 0;
@@ -1034,8 +1084,7 @@ int main(int, char**) {
 
     if (g_ui.tray) SDL_DestroyTray(g_ui.tray);
     if (g_ui.icon) SDL_DestroySurface(g_ui.icon);
-    if (g_ui.font_bold) TTF_CloseFont(g_ui.font_bold);
-    if (g_ui.font) TTF_CloseFont(g_ui.font);
+    close_fonts();
     if (g_ui.renderer) SDL_DestroyRenderer(g_ui.renderer);
     if (g_ui.window) SDL_DestroyWindow(g_ui.window);
     TTF_Quit();

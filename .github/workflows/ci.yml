@@ -44,7 +44,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: LLMUsageTray-macos
-          path: build/LLMUsageTray
+          path: build/LLMUsageTray.app
           if-no-files-found: error
 
   linux:

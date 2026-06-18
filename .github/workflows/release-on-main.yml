@@ -96,8 +96,8 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp build/LLMUsageTray dist/LLMUsageTray
-          tar -czf "dist/LLMUsageTray-${{ needs.version.outputs.version }}-macos.tar.gz" -C dist LLMUsageTray
+          cp -R build/LLMUsageTray.app dist/LLMUsageTray.app
+          tar -czf "dist/LLMUsageTray-${{ needs.version.outputs.version }}-macos.tar.gz" -C dist LLMUsageTray.app
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

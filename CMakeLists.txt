@@ -67,6 +67,8 @@ endif()
 
 if(WIN32)
     add_executable(LLMUsageTray WIN32 ${LLM_USAGE_TRAY_SOURCES})
+elseif(APPLE)
+    add_executable(LLMUsageTray MACOSX_BUNDLE ${LLM_USAGE_TRAY_SOURCES})
 else()
     add_executable(LLMUsageTray ${LLM_USAGE_TRAY_SOURCES})
 endif()
@@ -88,4 +90,14 @@ if(WIN32)
     )
 else()
     target_link_libraries(LLMUsageTray PRIVATE CURL::libcurl)
+endif()
+
+if(APPLE)
+    set_target_properties(LLMUsageTray PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/resources/macos/Info.plist.in"
+        MACOSX_BUNDLE_BUNDLE_NAME "LLM Usage Tray"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "works.tward.llm-usage-tray"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+    )
 endif()
