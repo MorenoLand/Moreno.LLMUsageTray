@@ -1120,7 +1120,11 @@ int main(int, char**) {
             else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) handle_mouse_down(event.button.x, event.button.y);
             else if (event.type == SDL_EVENT_MOUSE_MOTION) handle_mouse_motion();
             else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) handle_mouse_up(event.button.x, event.button.y);
-            else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) hide_panel();
+            else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+#if !defined(__linux__)
+                hide_panel();
+#endif
+            }
             else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) update_render_metrics();
             else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.api_key_mode && g_ui.api_input_focused) g_ui.api_key_input += event.text.text;
             else if (event.type == SDL_EVENT_KEY_DOWN && g_ui.api_key_mode) {
