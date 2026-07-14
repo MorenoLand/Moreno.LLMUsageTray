@@ -8,7 +8,10 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -29,6 +32,40 @@ static std::tm localtime_portable(std::time_t t) {
     localtime_r(&t, &local);
 #endif
     return local;
+}
+
+static std::filesystem::path codex_sessions_today_path() {
+#if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+#else
+    const char* home = std::getenv("HOME");
+#endif
+    if (!home || !*home) return {};
+    std::time_t now = std::time(nullptr);
+    std::tm local = localtime_portable(now);
+    char date[11]{};
+    std::strftime(date, sizeof(date), "%Y/%m/%d", &local);
+    return std::filesystem::path(home) / ".codex" / "sessions" / date;
+}
+
+static long long codex_tokens_today() {
+    std::filesystem::path directory = codex_sessions_today_path();
+    std::error_code error;
+    if (directory.empty() || !std::filesystem::is_directory(directory, error)) return 0;
+    long long total = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+        if (error) break;
+        if (!entry.is_regular_file(error) || entry.path().extension() != ".jsonl") continue;
+        std::ifstream in(entry.path());
+        long long session_total = 0;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.find("\"type\":\"token_count\"") == std::string::npos) continue;
+            if (auto tokens = json_number(line, "total_tokens")) session_total = std::max(session_total, static_cast<long long>(*tokens));
+        }
+        total += session_total;
+    }
+    return total;
 }
 
 static constexpr const char* kWhamUrl = "https://chatgpt.com/backend-api/wham/usage";
@@ -209,7 +246,9 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
     if (res.status < 200 || res.status >= 300) {
         throw std::runtime_error("Usage request failed: HTTP " + std::to_string(res.status));
     }
-    return parse_usage(res.body);
+    UsageInfo info = parse_usage(res.body);
+    info.local_codex_tokens_today = codex_tokens_today();
+    return info;
 }
 
 void warm_provider(const std::string& provider) {

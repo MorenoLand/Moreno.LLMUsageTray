@@ -12,8 +12,10 @@
 #include <cmath>
 #include <cctype>
 #include <filesystem>
+#include <iomanip>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -47,6 +49,7 @@ struct ProviderState {
     std::string secondary_row = "Weekly";
     bool primary_available = true;
     bool secondary_available = true;
+    long long local_codex_tokens_today = 0;
     double primary_left = 0;
     double secondary_left = 0;
     long long last_refresh_ms = 0;
@@ -126,6 +129,22 @@ const char* primary_row_label(int index) {
 
 const char* secondary_row_label(int index) {
     return index == 2 ? "Requests" : "Weekly";
+}
+
+std::string format_token_count(long long tokens) {
+    if (tokens < 1000) return std::to_string(tokens);
+    const char* suffix = "k";
+    double value = static_cast<double>(tokens) / 1000.0;
+    if (tokens >= 1000000000) {
+        suffix = "B";
+        value = static_cast<double>(tokens) / 1000000000.0;
+    } else if (tokens >= 1000000) {
+        suffix = "M";
+        value = static_cast<double>(tokens) / 1000000.0;
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(value < 10.0 ? 1 : 0) << value << suffix;
+    return out.str();
 }
 
 std::string openai_row_label(const RateWindow& window, const char* fallback) {
@@ -343,6 +362,7 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             state.secondary_available = info.secondary.available;
             state.primary_left = std::clamp(100.0 - info.primary.used_percent, 0.0, 100.0);
             state.secondary_left = std::clamp(100.0 - info.secondary.used_percent, 0.0, 100.0);
+            state.local_codex_tokens_today = info.local_codex_tokens_today;
             state.status = "Updated";
             state.last_refresh_ms = now_ms();
             state.busy = false;
@@ -768,6 +788,7 @@ void draw_panel() {
     bool busy, logged_in;
     std::string status, account, account_label, primary, secondary, primary_row, secondary_row;
     bool account_info_visible, primary_available, secondary_available;
+    long long local_codex_tokens_today;
     double primary_left, secondary_left;
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
@@ -787,6 +808,7 @@ void draw_panel() {
         secondary_available = state.secondary_available;
         primary_left = state.primary_left;
         secondary_left = state.secondary_left;
+        local_codex_tokens_today = state.local_codex_tokens_today;
     }
 
     g_ui.gpt_tab = {18, 12, 50, 24};
@@ -828,6 +850,7 @@ void draw_panel() {
 
     std::string subtitle = account_info_visible && !account.empty() ? account : account_label;
     if (subtitle.empty()) subtitle = status;
+    if (selected == 0 && !account_info_visible && local_codex_tokens_today > 0) subtitle = account_label + " | " + format_token_count(local_codex_tokens_today) + " tokens today";
     if (!logged_in) subtitle = selected == 2 ? "Open drawer to add a GLM API key." : "Open drawer to connect " + std::string(provider_label(selected)) + ".";
     subtitle = clip_text(subtitle, 304);
     text(18, 48, subtitle, 171, 181, 176);
@@ -905,11 +928,13 @@ void create_tray() {
 #else
     g_ui.tray = SDL_CreateTray(g_ui.icon, "LLM Usage Tray");
 #endif
+#if !defined(__linux__)
     if (g_ui.tray) {
         SDL_TrayMenu* menu = SDL_CreateTrayMenu(g_ui.tray);
         SDL_TrayEntry* quit = menu ? SDL_InsertTrayEntryAt(menu, -1, "Quit", SDL_TRAYENTRY_BUTTON) : nullptr;
         if (quit) SDL_SetTrayEntryCallback(quit, on_tray_quit, nullptr);
     }
+#endif
 }
 
 void handle_click(float x, float y) {
