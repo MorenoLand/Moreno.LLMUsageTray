@@ -15,6 +15,7 @@ struct UsageInfo {
     std::string plan_type;
     RateWindow primary;
     RateWindow secondary;
+    RateWindow tertiary;
     long long local_codex_tokens_today = 0;
 };
 

@@ -166,15 +166,23 @@ static std::string object_for_type(const std::string& body, const std::string& t
     return body.substr(start, end - start + 1);
 }
 
-static RateWindow parse_glm_window(const std::string& body, const std::string& type) {
-    std::string obj = object_for_type(body, type);
-    if (obj.empty()) return {};
-    RateWindow window;
-    window.available = true;
-    window.used_percent = json_number(obj, "percentage").value_or(0);
-    long long reset_ms = static_cast<long long>(json_number(obj, "nextResetTime").value_or(0));
-    window.reset_at = reset_ms > 100000000000LL ? reset_ms / 1000 : reset_ms;
-    return window;
+static RateWindow parse_glm_window(const std::string& body, const std::string& type, int unit = 0) {
+    std::size_t pos = 0;
+    while ((pos = body.find("\"type\":\"" + type + "\"", pos)) != std::string::npos) {
+        std::size_t start = body.rfind('{', pos);
+        std::size_t end = body.find('}', pos);
+        if (start == std::string::npos || end == std::string::npos) break;
+        std::string obj = body.substr(start, end - start + 1);
+        pos = end + 1;
+        if (unit && static_cast<int>(json_number(obj, "unit").value_or(0)) != unit) continue;
+        RateWindow window;
+        window.available = true;
+        window.used_percent = json_number(obj, "percentage").value_or(0);
+        long long reset_ms = static_cast<long long>(json_number(obj, "nextResetTime").value_or(0));
+        window.reset_at = reset_ms > 100000000000LL ? reset_ms / 1000 : reset_ms;
+        return window;
+    }
+    return {};
 }
 
 UsageInfo fetch_usage_with_auth() {
@@ -201,8 +209,9 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         UsageInfo info;
         info.email = "GLM API key";
         info.plan_type = "API";
-        info.primary = parse_glm_window(res.body, "TOKENS_LIMIT");
-        info.secondary = parse_glm_window(res.body, "TIME_LIMIT");
+        info.primary = parse_glm_window(res.body, "TOKENS_LIMIT", 3);
+        info.secondary = parse_glm_window(res.body, "TOKENS_LIMIT", 6);
+        info.tertiary = parse_glm_window(res.body, "TIME_LIMIT");
         return info;
     }
     auto credentials = load_credentials_provider(provider);

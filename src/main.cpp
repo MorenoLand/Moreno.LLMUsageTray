@@ -47,11 +47,15 @@ struct ProviderState {
     std::string secondary = "Weekly: unknown";
     std::string primary_row = "5 hour";
     std::string secondary_row = "Weekly";
+    std::string tertiary = "Requests: unknown";
+    std::string tertiary_row = "Requests";
     bool primary_available = true;
     bool secondary_available = true;
+    bool tertiary_available = false;
     long long local_codex_tokens_today = 0;
     double primary_left = 0;
     double secondary_left = 0;
+    double tertiary_left = 0;
     long long last_refresh_ms = 0;
 };
 
@@ -119,7 +123,6 @@ const char* primary_label(int index) {
 }
 
 const char* secondary_label(int index) {
-    if (index == 2) return "Requests";
     return "Weekly";
 }
 
@@ -128,7 +131,7 @@ const char* primary_row_label(int index) {
 }
 
 const char* secondary_row_label(int index) {
-    return index == 2 ? "Requests" : "Weekly";
+    return "Weekly";
 }
 
 std::string format_token_count(long long tokens) {
@@ -279,10 +282,9 @@ int wanted_panel_height() {
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         const auto& state = g_app.providers[g_app.selected];
-        rows = static_cast<int>(state.primary_available) + static_cast<int>(state.secondary_available);
+        rows = static_cast<int>(state.primary_available) + static_cast<int>(state.secondary_available) + static_cast<int>(state.tertiary_available);
     }
-    int missing_height = std::max(0, 2 - std::max(1, rows)) * kUsageRowHeight;
-    return (g_ui.drawer_open ? kPanelExpandedHeight : kPanelCollapsedHeight) - missing_height;
+    return (g_ui.drawer_open ? kPanelExpandedHeight : kPanelCollapsedHeight) + (rows - 2) * kUsageRowHeight;
 }
 
 void anchor_current_bottom() {
@@ -360,12 +362,16 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             }
             state.primary = format_usage_line(primary_label(provider_index), info.primary);
             state.secondary = format_usage_line(secondary_label(provider_index), info.secondary);
+            state.tertiary = format_usage_line("Requests", info.tertiary);
             state.primary_row = provider_index == 0 ? openai_row_label(info.primary, primary_row_label(provider_index)) : primary_row_label(provider_index);
             state.secondary_row = provider_index == 0 ? openai_row_label(info.secondary, secondary_row_label(provider_index)) : secondary_row_label(provider_index);
+            state.tertiary_row = "Requests";
             state.primary_available = info.primary.available;
             state.secondary_available = info.secondary.available;
+            state.tertiary_available = info.tertiary.available;
             state.primary_left = std::clamp(100.0 - info.primary.used_percent, 0.0, 100.0);
             state.secondary_left = std::clamp(100.0 - info.secondary.used_percent, 0.0, 100.0);
+            state.tertiary_left = std::clamp(100.0 - info.tertiary.used_percent, 0.0, 100.0);
             state.local_codex_tokens_today = info.local_codex_tokens_today;
             state.status = "Updated";
             state.last_refresh_ms = now_ms();
@@ -790,10 +796,10 @@ void draw_panel() {
 
     int selected;
     bool busy, logged_in;
-    std::string status, account, account_label, primary, secondary, primary_row, secondary_row;
-    bool account_info_visible, primary_available, secondary_available;
+    std::string status, account, account_label, primary, secondary, tertiary, primary_row, secondary_row, tertiary_row;
+    bool account_info_visible, primary_available, secondary_available, tertiary_available;
     long long local_codex_tokens_today;
-    double primary_left, secondary_left;
+    double primary_left, secondary_left, tertiary_left;
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         selected = g_app.selected;
@@ -806,12 +812,16 @@ void draw_panel() {
         account_info_visible = state.account_info_visible;
         primary = state.primary;
         secondary = state.secondary;
+        tertiary = state.tertiary;
         primary_row = state.primary_row;
         secondary_row = state.secondary_row;
+        tertiary_row = state.tertiary_row;
         primary_available = state.primary_available;
         secondary_available = state.secondary_available;
+        tertiary_available = state.tertiary_available;
         primary_left = state.primary_left;
         secondary_left = state.secondary_left;
+        tertiary_left = state.tertiary_left;
         local_codex_tokens_today = state.local_codex_tokens_today;
     }
 
@@ -867,6 +877,10 @@ void draw_panel() {
     }
     if (secondary_available) {
         usage_bar(18, usage_y, 304, secondary_row, secondary, secondary_left, true);
+        usage_y += 56;
+    }
+    if (tertiary_available) {
+        usage_bar(18, usage_y, 304, tertiary_row, tertiary, tertiary_left, true);
         usage_y += 56;
     }
 
