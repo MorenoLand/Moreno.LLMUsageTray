@@ -1058,7 +1058,8 @@ void init_state() {
 
 std::optional<std::filesystem::path> first_existing_font(const std::vector<std::filesystem::path>& paths) {
     for (const auto& path : paths) {
-        if (std::filesystem::exists(path)) return path;
+        std::error_code error;
+        if (std::filesystem::exists(path, error)) return path;
     }
     return std::nullopt;
 }
