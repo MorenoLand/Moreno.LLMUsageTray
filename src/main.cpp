@@ -818,10 +818,10 @@ void draw_panel() {
     tab(g_ui.claude_tab, "Claude", selected == 1);
     tab(g_ui.glm_tab, "GLM", selected == 2);
 
-    g_ui.account_info_button = {204, 10, 20, 28};
-    g_ui.top_refresh_button = {230, 10, 30, 28};
-    g_ui.pin_button = {264, 10, 30, 28};
-    g_ui.drawer_button = {298, 10, 30, 28};
+    g_ui.account_info_button = {222, 12, 24, 24};
+    g_ui.top_refresh_button = {250, 12, 24, 24};
+    g_ui.pin_button = {278, 12, 24, 24};
+    g_ui.drawer_button = {306, 12, 24, 24};
     draw_account_info(g_ui.account_info_button);
     draw_refresh(g_ui.top_refresh_button, logged_in && !busy);
     draw_pin(g_ui.pin_button, g_ui.pinned);
@@ -851,7 +851,8 @@ void draw_panel() {
     std::string subtitle = account_info_visible && !account.empty() ? account : account_label;
     if (subtitle.empty()) subtitle = status;
     if (selected == 0 && !account_info_visible && local_codex_tokens_today > 0) subtitle = account_label + " | " + format_token_count(local_codex_tokens_today) + " tokens today";
-    if (!logged_in) subtitle = selected == 2 ? "Open drawer to add a GLM API key." : "Open drawer to connect " + std::string(provider_label(selected)) + ".";
+    if (!logged_in && status != "Not logged in" && status != "Logged out" && status.rfind("Ready to refresh", 0) != 0) subtitle = status;
+    else if (!logged_in) subtitle = selected == 2 ? "Open drawer to add a GLM API key." : "Open drawer to connect " + std::string(provider_label(selected)) + ".";
     subtitle = clip_text(subtitle, 304);
     text(18, 48, subtitle, 171, 181, 176);
 

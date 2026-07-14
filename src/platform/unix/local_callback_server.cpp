@@ -59,7 +59,7 @@ static std::string oauth_page(const std::string& provider, bool success, const s
         ".card{text-align:center;max-width:520px;padding:32px}.logo{width:72px;height:72px;margin:0 auto 22px;border-radius:18px;background:#24292d;display:grid;place-items:center;border:1px solid #4da174}"
         ".bars{width:38px}.bar{height:8px;margin:7px 0;border-radius:999px}.a{background:#44bc7e}.b{background:#5291e0;width:70%}h1{font-size:28px;margin:0 0 10px}p{color:#aeb8b3;line-height:1.65;margin:0}.accent{color:" + accent + "}.details{margin-top:16px;color:#8d9792;font-family:monospace;font-size:13px;word-break:break-word}</style>"
         + close_script + "</head><body><main class=\"card\"><div class=\"logo\"><div class=\"bars\"><div class=\"bar a\"></div><div class=\"bar b\"></div></div></div>"
-        "<h1><span class=\"accent\">" + title + "</span></h1><p>" + provider + " is connected. You can close this tab.</p>"
+        "<h1><span class=\"accent\">" + title + "</span></h1><p>" + (success ? "Authorization received. Return to LLM Usage Tray to finish connecting." : provider + " could not be connected.") + "</p>"
         + (details.empty() ? "" : "<div class=\"details\">" + details + "</div>") + "</main></body></html>";
 }
 
