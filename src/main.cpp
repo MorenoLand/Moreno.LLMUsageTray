@@ -39,6 +39,8 @@ struct ProviderState {
     bool logged_in = false;
     std::string status = "Not logged in";
     std::string account;
+    std::string account_label;
+    bool account_info_visible = false;
     std::string primary = "5h: unknown";
     std::string secondary = "Weekly: unknown";
     std::string primary_row = "5 hour";
@@ -82,7 +84,7 @@ struct UiState {
     double drawer_anim = 0.0;
     std::string api_key_input;
     Rect gpt_tab, claude_tab, glm_tab;
-    Rect top_refresh_button, pin_button, drawer_button;
+    Rect account_info_button, top_refresh_button, pin_button, drawer_button;
     Rect login_button, refresh_button, warm_button, logout_button, quit_button;
     Rect api_input, api_ok, api_cancel;
 };
@@ -163,7 +165,7 @@ bool over_click_target(float x, float y) {
         return contains(g_ui.api_input, x, y) || contains(g_ui.api_ok, x, y) || contains(g_ui.api_cancel, x, y);
     }
     if (contains(g_ui.gpt_tab, x, y) || contains(g_ui.claude_tab, x, y) || contains(g_ui.glm_tab, x, y)) return true;
-    if (contains(g_ui.top_refresh_button, x, y) || contains(g_ui.pin_button, x, y) || contains(g_ui.drawer_button, x, y)) return true;
+    if (contains(g_ui.account_info_button, x, y) || contains(g_ui.top_refresh_button, x, y) || contains(g_ui.pin_button, x, y) || contains(g_ui.drawer_button, x, y)) return true;
     if (!g_ui.drawer_open) return false;
     return contains(g_ui.login_button, x, y) || contains(g_ui.refresh_button, x, y) ||
         contains(g_ui.warm_button, x, y) || contains(g_ui.logout_button, x, y) ||
@@ -323,9 +325,16 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             auto& state = g_app.providers[provider_index];
             state.logged_in = true;
             std::string plan = pretty_plan(info.plan_type);
-            if (provider_index == 1) state.account = "Claude";
-            else if (provider_index == 2) state.account = "GLM API key";
-            else state.account = info.email.empty() ? plan : info.email + " (" + plan + ")";
+            if (provider_index == 1) {
+                state.account = "Claude";
+                state.account_label = "Claude";
+            } else if (provider_index == 2) {
+                state.account = "GLM API key";
+                state.account_label = "GLM";
+            } else {
+                state.account = info.email.empty() ? plan : info.email + " (" + plan + ")";
+                state.account_label = plan.empty() ? "GPT" : plan;
+            }
             state.primary = format_usage_line(primary_label(provider_index), info.primary);
             state.secondary = format_usage_line(secondary_label(provider_index), info.secondary);
             state.primary_row = provider_index == 0 ? openai_row_label(info.primary, primary_row_label(provider_index)) : primary_row_label(provider_index);
@@ -425,6 +434,7 @@ void save_glm_key() {
         auto& state = g_app.providers[2];
         state.logged_in = true;
         state.account = "GLM API key";
+        state.account_label = "GLM";
         state.status = "API key saved";
         state.last_refresh_ms = 0;
     }
@@ -744,6 +754,10 @@ void draw_chevron(Rect r, bool open) {
     }
 }
 
+void draw_account_info(Rect r) {
+    button(r, "i", true);
+}
+
 void draw_panel() {
     set_color(0, 0, 0, 0);
     SDL_RenderClear(g_ui.renderer);
@@ -752,8 +766,8 @@ void draw_panel() {
 
     int selected;
     bool busy, logged_in;
-    std::string status, account, primary, secondary, primary_row, secondary_row;
-    bool primary_available, secondary_available;
+    std::string status, account, account_label, primary, secondary, primary_row, secondary_row;
+    bool account_info_visible, primary_available, secondary_available;
     double primary_left, secondary_left;
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
@@ -763,6 +777,8 @@ void draw_panel() {
         logged_in = state.logged_in;
         status = state.status;
         account = state.account;
+        account_label = state.account_label;
+        account_info_visible = state.account_info_visible;
         primary = state.primary;
         secondary = state.secondary;
         primary_row = state.primary_row;
@@ -780,9 +796,11 @@ void draw_panel() {
     tab(g_ui.claude_tab, "Claude", selected == 1);
     tab(g_ui.glm_tab, "GLM", selected == 2);
 
+    g_ui.account_info_button = {204, 10, 20, 28};
     g_ui.top_refresh_button = {230, 10, 30, 28};
     g_ui.pin_button = {264, 10, 30, 28};
     g_ui.drawer_button = {298, 10, 30, 28};
+    draw_account_info(g_ui.account_info_button);
     draw_refresh(g_ui.top_refresh_button, logged_in && !busy);
     draw_pin(g_ui.pin_button, g_ui.pinned);
     draw_chevron(g_ui.drawer_button, g_ui.drawer_open);
@@ -808,7 +826,8 @@ void draw_panel() {
         return;
     }
 
-    std::string subtitle = account.empty() ? status : account;
+    std::string subtitle = account_info_visible && !account.empty() ? account : account_label;
+    if (subtitle.empty()) subtitle = status;
     if (!logged_in) subtitle = selected == 2 ? "Open drawer to add a GLM API key." : "Open drawer to connect " + std::string(provider_label(selected)) + ".";
     subtitle = clip_text(subtitle, 304);
     text(18, 48, subtitle, 171, 181, 176);
@@ -818,7 +837,10 @@ void draw_panel() {
         usage_bar(18, usage_y, 304, primary_row, primary, primary_left, false);
         usage_y += 56;
     }
-    if (secondary_available) usage_bar(18, usage_y, 304, secondary_row, secondary, secondary_left, true);
+    if (secondary_available) {
+        usage_bar(18, usage_y, 304, secondary_row, secondary, secondary_left, true);
+        usage_y += 56;
+    }
 
     float drawer_y = usage_y + 10;
     g_ui.login_button = {18, drawer_y, 132, 30};
@@ -878,12 +900,16 @@ void create_tray() {
     SDL_SetPointerProperty(props, SDL_PROP_TRAY_CREATE_ICON_POINTER, g_ui.icon);
     SDL_SetStringProperty(props, SDL_PROP_TRAY_CREATE_TOOLTIP_STRING, "LLM Usage Tray");
     SDL_SetPointerProperty(props, SDL_PROP_TRAY_CREATE_LEFTCLICK_CALLBACK_POINTER, reinterpret_cast<void*>(on_tray_left_click));
-    SDL_SetPointerProperty(props, SDL_PROP_TRAY_CREATE_RIGHTCLICK_CALLBACK_POINTER, reinterpret_cast<void*>(on_tray_right_click));
     g_ui.tray = SDL_CreateTrayWithProperties(props);
     SDL_DestroyProperties(props);
 #else
     g_ui.tray = SDL_CreateTray(g_ui.icon, "LLM Usage Tray");
 #endif
+    if (g_ui.tray) {
+        SDL_TrayMenu* menu = SDL_CreateTrayMenu(g_ui.tray);
+        SDL_TrayEntry* quit = menu ? SDL_InsertTrayEntryAt(menu, -1, "Quit", SDL_TRAYENTRY_BUTTON) : nullptr;
+        if (quit) SDL_SetTrayEntryCallback(quit, on_tray_quit, nullptr);
+    }
 }
 
 void handle_click(float x, float y) {
@@ -912,6 +938,10 @@ void handle_click(float x, float y) {
     if (contains(g_ui.gpt_tab, x, y) || contains(g_ui.claude_tab, x, y) || contains(g_ui.glm_tab, x, y)) {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         g_app.selected = contains(g_ui.glm_tab, x, y) ? 2 : (contains(g_ui.claude_tab, x, y) ? 1 : 0);
+    } else if (contains(g_ui.account_info_button, x, y) && logged_in) {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        auto& state = g_app.providers[selected];
+        state.account_info_visible = !state.account_info_visible;
     } else if (contains(g_ui.top_refresh_button, x, y) && !busy && logged_in) {
         refresh_usage_async_for(selected, true);
     } else if (contains(g_ui.pin_button, x, y)) {
@@ -932,6 +962,8 @@ void handle_click(float x, float y) {
         auto& state = g_app.providers[selected];
         state.logged_in = false;
         state.account.clear();
+        state.account_label.clear();
+        state.account_info_visible = false;
         state.status = "Logged out";
         state.primary = std::string(primary_label(selected)) + ": unknown";
         state.secondary = std::string(secondary_label(selected)) + ": unknown";
@@ -991,6 +1023,7 @@ void init_state() {
         } else if (i == 2) {
             state.status = state.logged_in ? "Ready to refresh GLM" : "No GLM API key saved";
             state.account = state.logged_in ? "GLM API key" : "";
+            state.account_label = state.logged_in ? "GLM" : "";
             state.primary = "5h: unknown";
             state.secondary = "Requests: unknown";
         }
