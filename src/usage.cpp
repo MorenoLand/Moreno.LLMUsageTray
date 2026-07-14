@@ -50,20 +50,47 @@ static long long parse_iso_or_epoch_reset(const std::string& value) {
     return static_cast<long long>(timegm_portable(&tm));
 }
 
+static std::string object_for_key(const std::string& body, const std::string& key) {
+    std::size_t key_pos = body.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) return "";
+    std::size_t start = body.find(':', key_pos + key.size() + 2);
+    if (start == std::string::npos) return "";
+    start = body.find_first_not_of(" \t\r\n", start + 1);
+    if (start == std::string::npos || body[start] != '{') return "";
+    int depth = 0;
+    bool quoted = false;
+    bool escaped = false;
+    for (std::size_t i = start; i < body.size(); ++i) {
+        char c = body[i];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') quoted = false;
+        } else if (c == '"') quoted = true;
+        else if (c == '{') ++depth;
+        else if (c == '}' && --depth == 0) return body.substr(start, i - start + 1);
+    }
+    return "";
+}
+
+static RateWindow parse_openai_window(const std::string& body, const std::string& key) {
+    std::string object = object_for_key(body, key);
+    if (object.empty()) return {};
+    RateWindow window;
+    window.available = true;
+    window.used_percent = json_number(object, "used_percent").value_or(0);
+    window.reset_at = static_cast<long long>(json_number(object, "reset_at").value_or(0));
+    window.limit_window_seconds = static_cast<long long>(json_number(object, "limit_window_seconds").value_or(0));
+    return window;
+}
+
 static UsageInfo parse_usage(const std::string& body) {
     UsageInfo info;
     info.email = json_string(body, "email").value_or("");
     info.plan_type = json_string(body, "plan_type").value_or("");
-
-    std::size_t ppos = body.find("\"primary_window\"");
-    std::size_t spos = body.find("\"secondary_window\"");
-    std::string primary = ppos == std::string::npos ? body : body.substr(ppos, spos == std::string::npos ? std::string::npos : spos - ppos);
-    std::string secondary = spos == std::string::npos ? body : body.substr(spos);
-
-    info.primary.used_percent = json_number(primary, "used_percent").value_or(0);
-    info.primary.reset_at = static_cast<long long>(json_number(primary, "reset_at").value_or(0));
-    info.secondary.used_percent = json_number(secondary, "used_percent").value_or(0);
-    info.secondary.reset_at = static_cast<long long>(json_number(secondary, "reset_at").value_or(0));
+    std::string rate_limit = object_for_key(body, "rate_limit");
+    info.primary = parse_openai_window(rate_limit, "primary_window");
+    info.secondary = parse_openai_window(rate_limit, "secondary_window");
     return info;
 }
 
@@ -106,6 +133,7 @@ static RateWindow parse_glm_window(const std::string& body, const std::string& t
     std::string obj = object_for_type(body, type);
     if (obj.empty()) return {};
     RateWindow window;
+    window.available = true;
     window.used_percent = json_number(obj, "percentage").value_or(0);
     long long reset_ms = static_cast<long long>(json_number(obj, "nextResetTime").value_or(0));
     window.reset_at = reset_ms > 100000000000LL ? reset_ms / 1000 : reset_ms;
@@ -164,9 +192,11 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         std::size_t spos = res.body.find("\"seven_day\"");
         std::string five = fpos == std::string::npos ? res.body : res.body.substr(fpos, spos == std::string::npos ? std::string::npos : spos - fpos);
         std::string seven = spos == std::string::npos ? res.body : res.body.substr(spos);
+        info.primary.available = fpos != std::string::npos;
         info.primary.used_percent = json_number(five, "utilization").value_or(0);
         if (auto n = json_number(five, "resets_at")) info.primary.reset_at = static_cast<long long>(*n);
         else info.primary.reset_at = parse_iso_or_epoch_reset(json_string(five, "resets_at").value_or(""));
+        info.secondary.available = spos != std::string::npos;
         info.secondary.used_percent = json_number(seven, "utilization").value_or(0);
         if (auto n = json_number(seven, "resets_at")) info.secondary.reset_at = static_cast<long long>(*n);
         else info.secondary.reset_at = parse_iso_or_epoch_reset(json_string(seven, "resets_at").value_or(""));

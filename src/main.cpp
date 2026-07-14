@@ -24,6 +24,7 @@ constexpr int kPanelWidth = 340;
 constexpr int kPanelCollapsedHeight = 200;
 constexpr int kPanelApiKeyHeight = 204;
 constexpr int kPanelExpandedHeight = 344;
+constexpr int kUsageRowHeight = 56;
 constexpr int kProviderCount = 3;
 
 struct Rect {
@@ -40,6 +41,10 @@ struct ProviderState {
     std::string account;
     std::string primary = "5h: unknown";
     std::string secondary = "Weekly: unknown";
+    std::string primary_row = "5 hour";
+    std::string secondary_row = "Weekly";
+    bool primary_available = true;
+    bool secondary_available = true;
     double primary_left = 0;
     double secondary_left = 0;
     long long last_refresh_ms = 0;
@@ -119,6 +124,12 @@ const char* primary_row_label(int index) {
 
 const char* secondary_row_label(int index) {
     return index == 2 ? "Requests" : "Weekly";
+}
+
+std::string openai_row_label(const RateWindow& window, const char* fallback) {
+    if (window.limit_window_seconds >= 6 * 24 * 60 * 60) return "Weekly";
+    if (window.limit_window_seconds >= 4 * 60 * 60 && window.limit_window_seconds <= 6 * 60 * 60) return "5 hour";
+    return fallback;
 }
 
 bool provider_has_auth(int index) {
@@ -239,7 +250,14 @@ void update_render_metrics(bool reload_fonts = true) {
 
 int wanted_panel_height() {
     if (g_ui.api_key_mode) return kPanelApiKeyHeight;
-    return g_ui.drawer_open ? kPanelExpandedHeight : kPanelCollapsedHeight;
+    int rows;
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        const auto& state = g_app.providers[g_app.selected];
+        rows = static_cast<int>(state.primary_available) + static_cast<int>(state.secondary_available);
+    }
+    int missing_height = std::max(0, 2 - std::max(1, rows)) * kUsageRowHeight;
+    return (g_ui.drawer_open ? kPanelExpandedHeight : kPanelCollapsedHeight) - missing_height;
 }
 
 void anchor_current_bottom() {
@@ -310,6 +328,10 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             else state.account = info.email.empty() ? plan : info.email + " (" + plan + ")";
             state.primary = format_usage_line(primary_label(provider_index), info.primary);
             state.secondary = format_usage_line(secondary_label(provider_index), info.secondary);
+            state.primary_row = provider_index == 0 ? openai_row_label(info.primary, primary_row_label(provider_index)) : primary_row_label(provider_index);
+            state.secondary_row = provider_index == 0 ? openai_row_label(info.secondary, secondary_row_label(provider_index)) : secondary_row_label(provider_index);
+            state.primary_available = info.primary.available;
+            state.secondary_available = info.secondary.available;
             state.primary_left = std::clamp(100.0 - info.primary.used_percent, 0.0, 100.0);
             state.secondary_left = std::clamp(100.0 - info.secondary.used_percent, 0.0, 100.0);
             state.status = "Updated";
@@ -408,7 +430,7 @@ void save_glm_key() {
     }
     g_ui.api_key_mode = false;
     g_ui.api_input_focused = false;
-    set_target_height(g_ui.drawer_open ? kPanelExpandedHeight : kPanelCollapsedHeight);
+    set_target_height(wanted_panel_height());
     SDL_StopTextInput(g_ui.window);
     refresh_usage_async_for(2, true);
 }
@@ -730,7 +752,8 @@ void draw_panel() {
 
     int selected;
     bool busy, logged_in;
-    std::string status, account, primary, secondary;
+    std::string status, account, primary, secondary, primary_row, secondary_row;
+    bool primary_available, secondary_available;
     double primary_left, secondary_left;
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
@@ -742,6 +765,10 @@ void draw_panel() {
         account = state.account;
         primary = state.primary;
         secondary = state.secondary;
+        primary_row = state.primary_row;
+        secondary_row = state.secondary_row;
+        primary_available = state.primary_available;
+        secondary_available = state.secondary_available;
         primary_left = state.primary_left;
         secondary_left = state.secondary_left;
     }
@@ -786,14 +813,19 @@ void draw_panel() {
     subtitle = clip_text(subtitle, 304);
     text(18, 48, subtitle, 171, 181, 176);
 
-    usage_bar(18, 82, 304, primary_row_label(selected), primary, primary_left, false);
-    usage_bar(18, 138, 304, secondary_row_label(selected), secondary, secondary_left, true);
+    float usage_y = 82;
+    if (primary_available) {
+        usage_bar(18, usage_y, 304, primary_row, primary, primary_left, false);
+        usage_y += 56;
+    }
+    if (secondary_available) usage_bar(18, usage_y, 304, secondary_row, secondary, secondary_left, true);
 
-    g_ui.login_button = {18, 204, 132, 30};
-    g_ui.refresh_button = {164, 204, 158, 30};
-    g_ui.warm_button = {18, 244, 304, 30};
-    g_ui.logout_button = {18, 284, 132, 30};
-    g_ui.quit_button = {164, 284, 158, 30};
+    float drawer_y = usage_y + 10;
+    g_ui.login_button = {18, drawer_y, 132, 30};
+    g_ui.refresh_button = {164, drawer_y, 158, 30};
+    g_ui.warm_button = {18, drawer_y + 40, 304, 30};
+    g_ui.logout_button = {18, drawer_y + 80, 132, 30};
+    g_ui.quit_button = {164, drawer_y + 80, 158, 30};
 
     if (g_ui.drawer_open) {
         button(g_ui.login_button, logged_in ? (selected == 2 ? "Key saved" : "Logged in") : (selected == 2 ? "Set API key" : "Login"), !busy && !logged_in);
@@ -863,7 +895,7 @@ void handle_click(float x, float y) {
         else if (contains(g_ui.api_cancel, x, y)) {
             g_ui.api_key_mode = false;
             g_ui.api_input_focused = false;
-            set_target_height(g_ui.drawer_open ? kPanelExpandedHeight : kPanelCollapsedHeight);
+            set_target_height(wanted_panel_height());
             SDL_StopTextInput(g_ui.window);
         }
         return;
@@ -905,6 +937,8 @@ void handle_click(float x, float y) {
         state.secondary = std::string(secondary_label(selected)) + ": unknown";
         state.primary_left = 0;
         state.secondary_left = 0;
+        state.primary_available = true;
+        state.secondary_available = true;
         state.last_refresh_ms = 0;
     } else if (g_ui.drawer_open && contains(g_ui.quit_button, x, y)) {
         g_quit = true;
@@ -1046,7 +1080,7 @@ int main(int, char**) {
                 else if (event.key.key == SDLK_ESCAPE) {
                     g_ui.api_key_mode = false;
                     g_ui.api_input_focused = false;
-                    set_target_height(g_ui.drawer_open ? kPanelExpandedHeight : kPanelCollapsedHeight);
+                    set_target_height(wanted_panel_height());
                     SDL_StopTextInput(g_ui.window);
                 }
             }
@@ -1055,6 +1089,9 @@ int main(int, char**) {
         if (g_show_requested) show_panel();
         if (g_refresh_requested.exchange(false)) refresh_usage_async_for(selected_provider(), true);
         if (g_warm_requested.exchange(false)) warm_async_for(selected_provider());
+
+        int wanted_height = wanted_panel_height();
+        if (g_ui.target_height != wanted_height) set_target_height(wanted_height);
 
         if (g_ui.panel_height != g_ui.target_height) {
             int delta = g_ui.target_height - g_ui.panel_height;

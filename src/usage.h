@@ -4,8 +4,10 @@
 #include <string>
 
 struct RateWindow {
+    bool available = false;
     double used_percent = 0;
     long long reset_at = 0;
+    long long limit_window_seconds = 0;
 };
 
 struct UsageInfo {
