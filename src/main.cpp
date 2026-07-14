@@ -191,6 +191,10 @@ bool over_click_target(float x, float y) {
         contains(g_ui.quit_button, x, y);
 }
 
+SDL_HitTestResult SDLCALL hit_test(SDL_Window*, const SDL_Point* area, void*) {
+    return over_click_target(static_cast<float>(area->x), static_cast<float>(area->y)) ? SDL_HITTEST_NORMAL : SDL_HITTEST_DRAGGABLE;
+}
+
 void fill_surface_rect(SDL_Surface* surface, SDL_Rect rect, Uint32 color) {
     SDL_FillSurfaceRect(surface, &rect, color);
 }
@@ -1100,6 +1104,9 @@ int main(int, char**) {
         SDL_WINDOW_HIDDEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP |
         SDL_WINDOW_TRANSPARENT | SDL_WINDOW_UTILITY | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_ui.window) return 1;
+#if defined(__linux__)
+    SDL_SetWindowHitTest(g_ui.window, hit_test, nullptr);
+#endif
     g_ui.renderer = SDL_CreateRenderer(g_ui.window, nullptr);
     if (!g_ui.renderer) return 1;
     SDL_SetRenderVSync(g_ui.renderer, 1);
