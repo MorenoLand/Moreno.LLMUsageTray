@@ -929,13 +929,13 @@ void create_tray() {
 #else
     g_ui.tray = SDL_CreateTray(g_ui.icon, "LLM Usage Tray");
 #endif
-#if !defined(__linux__)
     if (g_ui.tray) {
         SDL_TrayMenu* menu = SDL_CreateTrayMenu(g_ui.tray);
+        SDL_TrayEntry* show = menu ? SDL_InsertTrayEntryAt(menu, -1, "Show", SDL_TRAYENTRY_BUTTON) : nullptr;
+        if (show) SDL_SetTrayEntryCallback(show, on_tray_show, nullptr);
         SDL_TrayEntry* quit = menu ? SDL_InsertTrayEntryAt(menu, -1, "Quit", SDL_TRAYENTRY_BUTTON) : nullptr;
         if (quit) SDL_SetTrayEntryCallback(quit, on_tray_quit, nullptr);
     }
-#endif
 }
 
 void handle_click(float x, float y) {
