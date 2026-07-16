@@ -88,6 +88,7 @@ struct UiState {
     int panel_height = kPanelCollapsedHeight;
     int target_height = kPanelCollapsedHeight;
     int anchor_bottom = 0;
+    long long shown_at_ms = 0;
     double drawer_anim = 0.0;
     std::string api_key_input;
     Rect gpt_tab, claude_tab, glm_tab;
@@ -313,6 +314,7 @@ void set_target_height(int height, bool immediate = false) {
 void show_panel() {
     g_show_requested = false;
     g_ui.visible = true;
+    g_ui.shown_at_ms = now_ms();
     g_ui.panel_height = wanted_panel_height();
     g_ui.target_height = g_ui.panel_height;
     SDL_SetWindowSize(g_ui.window, kPanelWidth, g_ui.panel_height);
@@ -1143,7 +1145,9 @@ int main(int, char**) {
             else if (event.type == SDL_EVENT_MOUSE_MOTION) handle_mouse_motion();
             else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) handle_mouse_up(event.button.x, event.button.y);
             else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
-#if !defined(__linux__)
+#if defined(__linux__)
+                if (now_ms() - g_ui.shown_at_ms > 250) hide_panel();
+#else
                 hide_panel();
 #endif
             }
