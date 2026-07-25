@@ -74,6 +74,7 @@ struct UiState {
     TTF_Font* font_bold = nullptr;
     std::filesystem::path font_path;
     std::filesystem::path font_bold_path;
+    float panel_scale = 1.0f;
     float render_scale = 1.0f;
     float font_scale = 0.0f;
     bool visible = false;
@@ -103,6 +104,18 @@ std::atomic_bool g_quit{false};
 std::atomic_bool g_show_requested{false};
 std::atomic_bool g_refresh_requested{false};
 std::atomic_bool g_warm_requested{false};
+
+int panel_width_px() { return static_cast<int>(std::round(kPanelWidth * g_ui.panel_scale)); }
+int panel_height_px() { return static_cast<int>(std::round(g_ui.panel_height * g_ui.panel_scale)); }
+
+float window_panel_scale() {
+    SDL_Rect bounds{};
+    SDL_DisplayID display = SDL_GetDisplayForWindow(g_ui.window);
+    float resolution_scale = display && SDL_GetDisplayBounds(display, &bounds) ? std::clamp(static_cast<float>(bounds.h) / 1440.0f, 1.0f, 1.5f) : 1.0f;
+    return std::max(SDL_GetWindowDisplayScale(g_ui.window), resolution_scale);
+}
+
+float logical_coordinate(float value) { return value / g_ui.panel_scale; }
 
 long long now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -196,7 +209,7 @@ bool over_click_target(float x, float y) {
 }
 
 SDL_HitTestResult SDLCALL hit_test(SDL_Window*, const SDL_Point* area, void*) {
-    return over_click_target(static_cast<float>(area->x), static_cast<float>(area->y)) ? SDL_HITTEST_NORMAL : SDL_HITTEST_DRAGGABLE;
+    return over_click_target(logical_coordinate(static_cast<float>(area->x)), logical_coordinate(static_cast<float>(area->y))) ? SDL_HITTEST_NORMAL : SDL_HITTEST_DRAGGABLE;
 }
 
 void fill_surface_rect(SDL_Surface* surface, SDL_Rect rect, Uint32 color) {
@@ -234,10 +247,12 @@ void fill_surface_round_rect(SDL_Surface* surface, SDL_Rect rect, int radius, Ui
 }
 
 void update_window_shape() {
-    SDL_Surface* shape = SDL_CreateSurface(kPanelWidth, g_ui.panel_height, SDL_PIXELFORMAT_RGBA32);
+    int width = panel_width_px();
+    int height = panel_height_px();
+    SDL_Surface* shape = SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
     if (!shape) return;
     SDL_ClearSurface(shape, 0, 0, 0, 0);
-    fill_surface_round(shape, kPanelWidth, g_ui.panel_height, 9, SDL_MapSurfaceRGBA(shape, 255, 255, 255, 255));
+    fill_surface_round(shape, width, height, static_cast<int>(std::round(9 * g_ui.panel_scale)), SDL_MapSurfaceRGBA(shape, 255, 255, 255, 255));
     SDL_SetWindowShape(g_ui.window, shape);
     SDL_DestroySurface(shape);
 }
@@ -292,7 +307,7 @@ void anchor_current_bottom() {
     int wx = 0;
     int wy = 0;
     SDL_GetWindowPosition(g_ui.window, &wx, &wy);
-    g_ui.anchor_bottom = wy + g_ui.panel_height;
+    g_ui.anchor_bottom = wy + panel_height_px();
 }
 
 void set_target_height(int height, bool immediate = false) {
@@ -300,13 +315,13 @@ void set_target_height(int height, bool immediate = false) {
     g_ui.target_height = height;
     if (!immediate) return;
     g_ui.panel_height = height;
-    SDL_SetWindowSize(g_ui.window, kPanelWidth, g_ui.panel_height);
+    SDL_SetWindowSize(g_ui.window, panel_width_px(), panel_height_px());
     update_render_metrics();
     if (g_ui.anchor_bottom > 0) {
         int wx = 0;
         int wy = 0;
         SDL_GetWindowPosition(g_ui.window, &wx, &wy);
-        SDL_SetWindowPosition(g_ui.window, wx, g_ui.anchor_bottom - g_ui.panel_height);
+        SDL_SetWindowPosition(g_ui.window, wx, g_ui.anchor_bottom - panel_height_px());
     }
     update_window_shape();
 }
@@ -317,12 +332,12 @@ void show_panel() {
     g_ui.shown_at_ms = now_ms();
     g_ui.panel_height = wanted_panel_height();
     g_ui.target_height = g_ui.panel_height;
-    SDL_SetWindowSize(g_ui.window, kPanelWidth, g_ui.panel_height);
+    SDL_SetWindowSize(g_ui.window, panel_width_px(), panel_height_px());
     update_render_metrics();
     float mx = 0, my = 0;
     SDL_GetGlobalMouseState(&mx, &my);
-    g_ui.anchor_bottom = static_cast<int>(my) - 12;
-    SDL_SetWindowPosition(g_ui.window, static_cast<int>(mx) - kPanelWidth + 20, g_ui.anchor_bottom - g_ui.panel_height);
+    g_ui.anchor_bottom = static_cast<int>(my) - static_cast<int>(std::round(12 * g_ui.panel_scale));
+    SDL_SetWindowPosition(g_ui.window, static_cast<int>(mx) - panel_width_px() + static_cast<int>(std::round(20 * g_ui.panel_scale)), g_ui.anchor_bottom - panel_height_px());
     update_window_shape();
     SDL_ShowWindow(g_ui.window);
     SDL_RaiseWindow(g_ui.window);
@@ -1045,7 +1060,7 @@ void handle_mouse_motion() {
     int nx = static_cast<int>(gx) - g_ui.drag_offset_x;
     int ny = static_cast<int>(gy) - g_ui.drag_offset_y;
     SDL_SetWindowPosition(g_ui.window, nx, ny);
-    g_ui.anchor_bottom = ny + g_ui.panel_height;
+    g_ui.anchor_bottom = ny + panel_height_px();
     g_ui.drag_moved = true;
 }
 
@@ -1125,6 +1140,8 @@ int main(int, char**) {
 #endif
     g_ui.renderer = SDL_CreateRenderer(g_ui.window, nullptr);
     if (!g_ui.renderer) return 1;
+    g_ui.panel_scale = window_panel_scale();
+    SDL_SetWindowSize(g_ui.window, panel_width_px(), panel_height_px());
     SDL_SetRenderVSync(g_ui.renderer, 1);
     SDL_SetRenderDrawBlendMode(g_ui.renderer, SDL_BLENDMODE_BLEND);
     update_render_metrics(false);
@@ -1141,9 +1158,9 @@ int main(int, char**) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) g_quit = true;
-            else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) handle_mouse_down(event.button.x, event.button.y);
+            else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) handle_mouse_down(logical_coordinate(event.button.x), logical_coordinate(event.button.y));
             else if (event.type == SDL_EVENT_MOUSE_MOTION) handle_mouse_motion();
-            else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) handle_mouse_up(event.button.x, event.button.y);
+            else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) handle_mouse_up(logical_coordinate(event.button.x), logical_coordinate(event.button.y));
             else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
 #if defined(__linux__)
                 if (now_ms() - g_ui.shown_at_ms > 250) hide_panel();
@@ -1186,13 +1203,13 @@ int main(int, char**) {
             int delta = g_ui.target_height - g_ui.panel_height;
             int step = std::max(8, static_cast<int>(std::ceil(std::abs(delta) * 0.38f)));
             g_ui.panel_height += std::abs(delta) <= step ? delta : step * (delta > 0 ? 1 : -1);
-            SDL_SetWindowSize(g_ui.window, kPanelWidth, g_ui.panel_height);
+            SDL_SetWindowSize(g_ui.window, panel_width_px(), panel_height_px());
             update_render_metrics();
             if (g_ui.anchor_bottom > 0) {
                 int wx = 0;
                 int wy = 0;
                 SDL_GetWindowPosition(g_ui.window, &wx, &wy);
-                SDL_SetWindowPosition(g_ui.window, wx, g_ui.anchor_bottom - g_ui.panel_height);
+                SDL_SetWindowPosition(g_ui.window, wx, g_ui.anchor_bottom - panel_height_px());
             }
             update_window_shape();
         }
