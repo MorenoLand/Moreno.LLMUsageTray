@@ -809,7 +809,10 @@ void draw_panel() {
     set_color(0, 0, 0, 0);
     SDL_RenderClear(g_ui.renderer);
     aa_round_rect({0, 0, static_cast<float>(kPanelWidth), static_cast<float>(g_ui.panel_height)}, 9,
-        color(23, 26, 28), color(64, 74, 78));
+        color(17, 20, 22), color(67, 80, 83));
+    aa_round_rect({1, 1, static_cast<float>(kPanelWidth - 2), static_cast<float>(g_ui.panel_height - 2)}, 8,
+        color(23, 26, 28), color(37, 45, 47));
+    fill({10, 2, static_cast<float>(kPanelWidth - 20), 1}, 70, 82, 84, 92);
 
     int selected;
     bool busy, logged_in;
@@ -881,7 +884,7 @@ void draw_panel() {
 
     std::string subtitle = account_info_visible && !account.empty() ? account : account_label;
     if (subtitle.empty()) subtitle = status;
-    if (selected == 0 && !account_info_visible && local_codex_tokens_today > 0) subtitle = account_label + " | " + format_token_count(local_codex_tokens_today) + " tokens today";
+    // if (selected == 0 && !account_info_visible && local_codex_tokens_today > 0) subtitle = account_label + " | " + format_token_count(local_codex_tokens_today) + " tokens today";
     if (!logged_in && status != "Not logged in" && status != "Logged out" && status.rfind("Ready to refresh", 0) != 0) subtitle = status;
     else if (!logged_in) subtitle = selected == 2 ? "Open drawer to add a GLM API key." : "Open drawer to connect " + std::string(provider_label(selected)) + ".";
     subtitle = clip_text(subtitle, 304);
