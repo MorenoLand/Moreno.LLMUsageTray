@@ -116,8 +116,10 @@ static RateWindow parse_openai_window(const std::string& body, const std::string
     RateWindow window;
     window.available = true;
     window.used_percent = json_number(object, "used_percent").value_or(0);
-    window.reset_at = static_cast<long long>(json_number(object, "reset_at").value_or(0));
-    window.limit_window_seconds = static_cast<long long>(json_number(object, "limit_window_seconds").value_or(0));
+    if (auto reset_at = json_number(object, "reset_at")) window.reset_at = static_cast<long long>(*reset_at);
+    else window.reset_at = parse_iso_or_epoch_reset(json_string(object, "resets_at").value_or(""));
+    if (auto limit_window_seconds = json_number(object, "limit_window_seconds")) window.limit_window_seconds = static_cast<long long>(*limit_window_seconds);
+    else window.limit_window_seconds = static_cast<long long>(json_number(object, "window_minutes").value_or(0) * 60.0);
     return window;
 }
 
@@ -127,7 +129,9 @@ static UsageInfo parse_usage(const std::string& body) {
     info.plan_type = json_string(body, "plan_type").value_or("");
     std::string rate_limit = object_for_key(body, "rate_limit");
     info.primary = parse_openai_window(rate_limit, "primary_window");
+    if (!info.primary.available) info.primary = parse_openai_window(rate_limit, "primary");
     info.secondary = parse_openai_window(rate_limit, "secondary_window");
+    if (!info.secondary.available) info.secondary = parse_openai_window(rate_limit, "secondary");
     return info;
 }
 
@@ -249,9 +253,11 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         return info;
     }
 
-    HttpResponse res = http_get(kWhamUrl, {
+    std::map<std::string, std::string> headers = {
         {"Authorization", "Bearer " + credentials->access},
-    });
+    };
+    if (!credentials->account_id.empty()) headers["ChatGPT-Account-Id"] = credentials->account_id;
+    HttpResponse res = http_get(kWhamUrl, headers);
     if (res.status < 200 || res.status >= 300) {
         throw std::runtime_error("Usage request failed: HTTP " + std::to_string(res.status));
     }
