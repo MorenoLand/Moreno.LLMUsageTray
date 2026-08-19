@@ -16,7 +16,6 @@ struct UsageInfo {
     RateWindow primary;
     RateWindow secondary;
     RateWindow tertiary;
-    long long local_codex_tokens_today = 0;
 };
 
 UsageInfo fetch_usage_with_auth();

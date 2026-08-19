@@ -67,6 +67,7 @@ static HttpResponse request(const std::string& method, const std::string& url, c
         WinHttpCloseHandle(session);
         throw std::runtime_error("WinHttpOpenRequest failed");
     }
+    WinHttpSetTimeouts(req, 15000, 15000, 15000, 30000);
 
     std::wstring all_headers;
     for (const auto& [k, v] : headers) {

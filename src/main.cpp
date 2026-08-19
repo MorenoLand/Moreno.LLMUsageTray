@@ -12,10 +12,8 @@
 #include <cmath>
 #include <cctype>
 #include <filesystem>
-#include <iomanip>
 #include <mutex>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -38,6 +36,7 @@ struct Rect {
 
 struct ProviderState {
     bool busy = false;
+    unsigned long long operation_id = 0;
     bool logged_in = false;
     std::string status = "Not logged in";
     std::string account;
@@ -51,7 +50,6 @@ struct ProviderState {
     bool primary_available = true;
     bool secondary_available = true;
     bool tertiary_available = false;
-    long long local_codex_tokens_today = 0;
     double primary_left = 0;
     double secondary_left = 0;
     double tertiary_left = 0;
@@ -145,22 +143,6 @@ const char* primary_row_label(int index) {
 
 const char* secondary_row_label(int index) {
     return "Weekly";
-}
-
-std::string format_token_count(long long tokens) {
-    if (tokens < 1000) return std::to_string(tokens);
-    const char* suffix = "k";
-    double value = static_cast<double>(tokens) / 1000.0;
-    if (tokens >= 1000000000) {
-        suffix = "B";
-        value = static_cast<double>(tokens) / 1000000000.0;
-    } else if (tokens >= 1000000) {
-        suffix = "M";
-        value = static_cast<double>(tokens) / 1000000.0;
-    }
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(value < 10.0 ? 1 : 0) << value << suffix;
-    return out.str();
 }
 
 std::string openai_row_label(const RateWindow& window, const char* fallback) {
@@ -350,20 +332,23 @@ void hide_panel() {
 }
 
 void refresh_usage_async_for(int provider_index, bool force = false) {
+    unsigned long long operation_id;
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         auto& state = g_app.providers[provider_index];
         if (state.busy) return;
         if (!force && state.last_refresh_ms > 0 && now_ms() - state.last_refresh_ms < 5 * 60 * 1000) return;
+        operation_id = ++state.operation_id;
         state.busy = true;
         state.status = "Refreshing " + std::string(provider_label(provider_index)) + "...";
     }
 
-    std::thread([provider_index] {
+    std::thread([provider_index, operation_id] {
         try {
             UsageInfo info = fetch_usage_with_auth_provider(provider_key(provider_index));
             std::lock_guard<std::mutex> lock(g_app.mutex);
             auto& state = g_app.providers[provider_index];
+            if (state.operation_id != operation_id) return;
             state.logged_in = true;
             std::string plan = pretty_plan(info.plan_type);
             if (provider_index == 1) {
@@ -388,13 +373,13 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             state.primary_left = std::clamp(100.0 - info.primary.used_percent, 0.0, 100.0);
             state.secondary_left = std::clamp(100.0 - info.secondary.used_percent, 0.0, 100.0);
             state.tertiary_left = std::clamp(100.0 - info.tertiary.used_percent, 0.0, 100.0);
-            state.local_codex_tokens_today = info.local_codex_tokens_today;
             state.status = "Updated";
             state.last_refresh_ms = now_ms();
             state.busy = false;
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(g_app.mutex);
             auto& state = g_app.providers[provider_index];
+            if (state.operation_id != operation_id) return;
             state.logged_in = provider_has_auth(provider_index);
             state.status = e.what();
             state.busy = false;
@@ -403,20 +388,23 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
 }
 
 void warm_async_for(int provider_index) {
+    unsigned long long operation_id;
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         auto& state = g_app.providers[provider_index];
         if (state.busy || !state.logged_in) return;
+        operation_id = ++state.operation_id;
         state.busy = true;
         state.status = "Warming " + std::string(provider_label(provider_index)) + "...";
     }
 
-    std::thread([provider_index] {
+    std::thread([provider_index, operation_id] {
         try {
             warm_provider(provider_key(provider_index));
             {
                 std::lock_guard<std::mutex> lock(g_app.mutex);
                 auto& state = g_app.providers[provider_index];
+                if (state.operation_id != operation_id) return;
                 state.status = "Warm request sent";
                 state.busy = false;
                 state.last_refresh_ms = 0;
@@ -425,6 +413,7 @@ void warm_async_for(int provider_index) {
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(g_app.mutex);
             auto& state = g_app.providers[provider_index];
+            if (state.operation_id != operation_id) return;
             state.status = e.what();
             state.busy = false;
         }
@@ -443,20 +432,23 @@ void login_async_for(int provider_index) {
         return;
     }
 
+    unsigned long long operation_id;
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         auto& state = g_app.providers[provider_index];
         if (state.busy) return;
+        operation_id = ++state.operation_id;
         state.busy = true;
         state.status = "Waiting for " + std::string(provider_label(provider_index)) + " browser login...";
     }
 
-    std::thread([provider_index] {
+    std::thread([provider_index, operation_id] {
         try {
             oauth_login_browser_provider(provider_key(provider_index));
             {
                 std::lock_guard<std::mutex> lock(g_app.mutex);
                 auto& state = g_app.providers[provider_index];
+                if (state.operation_id != operation_id) return;
                 state.logged_in = true;
                 state.status = "Login complete";
                 state.busy = false;
@@ -465,6 +457,7 @@ void login_async_for(int provider_index) {
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(g_app.mutex);
             auto& state = g_app.providers[provider_index];
+            if (state.operation_id != operation_id) return;
             state.status = e.what();
             state.busy = false;
         }
@@ -899,7 +892,7 @@ void draw_panel() {
         button(g_ui.login_button, logged_in ? (selected == 2 ? "Key saved" : "Logged in") : (selected == 2 ? "Set API key" : "Login"), !busy && !logged_in);
         button(g_ui.refresh_button, busy ? "Refreshing..." : "Refresh now", !busy && logged_in);
         button(g_ui.warm_button, busy ? "Working..." : "Warm now", !busy && logged_in);
-        button(g_ui.logout_button, "Logout", !busy && logged_in);
+        button(g_ui.logout_button, "Logout", logged_in);
         button(g_ui.quit_button, "Quit", true);
     }
     SDL_RenderPresent(g_ui.renderer);
@@ -1000,10 +993,12 @@ void handle_click(float x, float y) {
         refresh_usage_async_for(selected, true);
     } else if (g_ui.drawer_open && contains(g_ui.warm_button, x, y) && !busy && logged_in) {
         warm_async_for(selected);
-    } else if (g_ui.drawer_open && contains(g_ui.logout_button, x, y) && !busy && logged_in) {
+    } else if (g_ui.drawer_open && contains(g_ui.logout_button, x, y) && logged_in) {
         clear_credentials_provider(provider_key(selected));
         std::lock_guard<std::mutex> lock(g_app.mutex);
         auto& state = g_app.providers[selected];
+        ++state.operation_id;
+        state.busy = false;
         state.logged_in = false;
         state.account.clear();
         state.account_label.clear();
