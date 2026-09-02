@@ -8,10 +8,12 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 static std::time_t timegm_portable(std::tm* tm) {
 #if defined(_WIN32)
@@ -37,6 +39,8 @@ static constexpr const char* kCodexResponsesUrl = "https://chatgpt.com/backend-a
 static constexpr const char* kClaudeMessagesUrl = "https://api.anthropic.com/v1/messages";
 static constexpr const char* kGlmQuotaUrl = "https://api.z.ai/api/monitor/usage/quota/limit";
 static constexpr const char* kGlmChatUrl = "https://api.z.ai/api/coding/paas/v4/chat/completions";
+static constexpr const char* kGeminiQuotaUrl = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+static constexpr const char* kGeminiQuotaSummaryUrl = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 
 static long long parse_iso_or_epoch_reset(const std::string& value) {
     if (value.empty()) return 0;
@@ -71,6 +75,91 @@ static std::string object_for_key(const std::string& body, const std::string& ke
         else if (c == '}' && --depth == 0) return body.substr(start, i - start + 1);
     }
     return "";
+}
+
+static std::string array_for_key(const std::string& body, const std::string& key) {
+    std::size_t key_pos = body.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) return "";
+    std::size_t start = body.find(':', key_pos + key.size() + 2);
+    if (start == std::string::npos) return "";
+    start = body.find_first_not_of(" \t\r\n", start + 1);
+    if (start == std::string::npos || body[start] != '[') return "";
+    int depth = 0;
+    bool quoted = false;
+    bool escaped = false;
+    for (std::size_t i = start; i < body.size(); ++i) {
+        char c = body[i];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') quoted = false;
+        } else if (c == '"') quoted = true;
+        else if (c == '[') ++depth;
+        else if (c == ']' && --depth == 0) return body.substr(start, i - start + 1);
+    }
+    return "";
+}
+
+static std::vector<std::string> objects_in_array(const std::string& array) {
+    std::vector<std::string> objects;
+    for (std::size_t i = 0; i < array.size(); ++i) {
+        if (array[i] != '{') continue;
+        int depth = 0;
+        bool quoted = false;
+        bool escaped = false;
+        for (std::size_t end = i; end < array.size(); ++end) {
+            char c = array[end];
+            if (quoted) {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == '"') quoted = false;
+            } else if (c == '"') quoted = true;
+            else if (c == '{') ++depth;
+            else if (c == '}' && --depth == 0) {
+                objects.push_back(array.substr(i, end - i + 1));
+                i = end;
+                break;
+            }
+        }
+    }
+    return objects;
+}
+
+static std::vector<std::pair<std::size_t, std::string>> objects_for_key(const std::string& body, const std::string& key) {
+    std::vector<std::pair<std::size_t, std::string>> objects;
+    std::size_t search = 0;
+    while (search < body.size()) {
+        std::size_t key_pos = body.find("\"" + key + "\"", search);
+        if (key_pos == std::string::npos) break;
+        std::size_t start = body.find(':', key_pos + key.size() + 2);
+        if (start == std::string::npos) break;
+        start = body.find_first_not_of(" \t\r\n", start + 1);
+        if (start == std::string::npos || body[start] != '{') {
+            search = key_pos + key.size() + 2;
+            continue;
+        }
+        int depth = 0;
+        bool quoted = false;
+        bool escaped = false;
+        bool complete = false;
+        for (std::size_t end = start; end < body.size(); ++end) {
+            char c = body[end];
+            if (quoted) {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == '"') quoted = false;
+            } else if (c == '"') quoted = true;
+            else if (c == '{') ++depth;
+            else if (c == '}' && --depth == 0) {
+                objects.emplace_back(key_pos, body.substr(start, end - start + 1));
+                search = end + 1;
+                complete = true;
+                break;
+            }
+        }
+        if (!complete) break;
+    }
+    return objects;
 }
 
 static RateWindow parse_openai_window(const std::string& body, const std::string& key) {
@@ -152,6 +241,107 @@ static RateWindow parse_glm_window(const std::string& body, const std::string& t
     return {};
 }
 
+static RateWindow parse_gemini_window(const std::string& object) {
+    std::optional<double> remaining = json_number(object, "remainingFraction");
+    if (!remaining) remaining = json_number(object_for_key(object, "remaining"), "remainingFraction");
+    if (!remaining) {
+        std::string value = json_string(object, "remainingFraction").value_or("");
+        if (value.empty()) value = json_string(object_for_key(object, "remaining"), "remainingFraction").value_or("");
+        if (!value.empty()) {
+            char* end = nullptr;
+            double parsed = std::strtod(value.c_str(), &end);
+            if (end != value.c_str()) remaining = parsed;
+        }
+    }
+    if (!remaining) return {};
+    RateWindow window;
+    window.available = true;
+    window.used_percent = (1.0 - std::clamp(*remaining, 0.0, 1.0)) * 100.0;
+    window.reset_at = parse_iso_or_epoch_reset(json_string(object, "resetTime").value_or(""));
+    return window;
+}
+
+static void add_gemini_window(UsageInfo& info, const std::string& model, const RateWindow& window) {
+    if (!window.available) return;
+    std::string lower = model;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    bool pro = lower.find("pro") != std::string::npos;
+    bool flash = lower.find("flash") != std::string::npos;
+    if ((pro || (!flash && !info.primary.available)) && !info.primary.available) info.primary = window;
+    else if ((flash || !info.secondary.available) && !info.secondary.available) info.secondary = window;
+}
+
+static std::string gemini_model_name_before(const std::string& body, std::size_t key_pos) {
+    std::size_t parent_start = body.rfind('{', key_pos);
+    if (parent_start == std::string::npos || parent_start == 0) return "";
+    std::size_t quote_end = body.rfind('"', parent_start - 1);
+    if (quote_end == std::string::npos || quote_end == 0) return "";
+    std::size_t quote_start = body.rfind('"', quote_end - 1);
+    if (quote_start == std::string::npos || quote_start >= quote_end) return "";
+    return body.substr(quote_start + 1, quote_end - quote_start - 1);
+}
+
+static UsageInfo parse_gemini_usage(const std::string& body) {
+    UsageInfo info;
+    info.plan_type = "Gemini";
+    for (const std::string& object : objects_in_array(array_for_key(body, "buckets"))) {
+        add_gemini_window(info, json_string(object, "modelId").value_or(""), parse_gemini_window(object));
+    }
+    for (const auto& match : objects_for_key(body, "quotaInfo")) {
+        add_gemini_window(info, gemini_model_name_before(body, match.first), parse_gemini_window(match.second));
+    }
+    if (!info.primary.available && !info.secondary.available) throw std::runtime_error("Gemini quota response contained no model windows");
+    return info;
+}
+
+static UsageInfo parse_gemini_summary(const std::string& body) {
+    UsageInfo info;
+    info.plan_type = "Gemini";
+    std::vector<std::string> groups = objects_in_array(array_for_key(body, "groups"));
+    bool has_named_group = false;
+    bool has_gemini_group = false;
+    for (const std::string& group : groups) {
+        std::string group_name = json_string(group, "displayName").value_or("");
+        if (!group_name.empty()) has_named_group = true;
+        std::transform(group_name.begin(), group_name.end(), group_name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (group_name.find("gemini") != std::string::npos) has_gemini_group = true;
+    }
+    if (has_named_group && !has_gemini_group) throw std::runtime_error("Gemini quota summary contained no Gemini group");
+    for (const std::string& group : groups) {
+        std::string group_name = json_string(group, "displayName").value_or("");
+        std::string lower_group = group_name;
+        std::transform(lower_group.begin(), lower_group.end(), lower_group.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (has_gemini_group && lower_group.find("gemini") == std::string::npos) continue;
+        for (const std::string& bucket : objects_in_array(array_for_key(group, "buckets"))) {
+            RateWindow window = parse_gemini_window(bucket);
+            if (!window.available) continue;
+            std::string kind = json_string(bucket, "window").value_or("") + " " + json_string(bucket, "displayName").value_or("");
+            std::transform(kind.begin(), kind.end(), kind.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if ((kind.find("5") != std::string::npos || kind.find("hour") != std::string::npos) && !info.primary.available) {
+                window.limit_window_seconds = 5 * 60 * 60;
+                info.primary = window;
+            } else if ((kind.find("week") != std::string::npos || kind.find("seven") != std::string::npos || kind.find("day") != std::string::npos) && !info.secondary.available) {
+                window.limit_window_seconds = 7 * 24 * 60 * 60;
+                info.secondary = window;
+            } else {
+                add_gemini_window(info, kind, window);
+            }
+        }
+    }
+    if (!info.primary.available && !info.secondary.available) throw std::runtime_error("Gemini quota summary contained no model windows");
+    return info;
+}
+
+static std::string gemini_platform() {
+#if defined(_WIN32)
+    return "WINDOWS_AMD64";
+#elif defined(__APPLE__)
+    return "DARWIN_AMD64";
+#else
+    return "LINUX_AMD64";
+#endif
+}
+
 UsageInfo fetch_usage_with_auth() {
     return fetch_usage_with_auth_provider("openai");
 }
@@ -187,6 +377,31 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
     }
     if (credentials_expired(*credentials)) {
         credentials = oauth_refresh_provider(provider, credentials->refresh);
+    }
+
+    if (provider == "gemini") {
+        if (credentials->account_id.empty()) {
+            credentials->account_id = gemini_discover_project(credentials->access);
+            save_credentials_provider(provider, *credentials);
+        }
+        std::string body = "{\"project\":\"" + json_escape(credentials->account_id) + "\"}";
+        std::map<std::string, std::string> headers = {
+            {"Authorization", "Bearer " + credentials->access},
+            {"User-Agent", "antigravity/1.1.24"},
+            {"Client-Metadata", "{\"ideType\":\"ANTIGRAVITY\",\"platform\":\"" + gemini_platform() + "\",\"pluginType\":\"GEMINI\"}"},
+        };
+        HttpResponse summary = http_post_json(kGeminiQuotaSummaryUrl, body, headers);
+        if (summary.status >= 200 && summary.status < 300) {
+            try {
+                return parse_gemini_summary(summary.body);
+            } catch (const std::exception&) {
+            }
+        }
+        HttpResponse res = http_post_json(kGeminiQuotaUrl, body, headers);
+        if (res.status < 200 || res.status >= 300) {
+            throw std::runtime_error("Gemini quota request failed: HTTP " + std::to_string(res.status));
+        }
+        return parse_gemini_usage(res.body);
     }
 
     if (provider == "anthropic") {

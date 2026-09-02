@@ -1,4 +1,6 @@
 #include "oauth.h"
+#include "credential_store.h"
+#include "json_util.h"
 #include "usage.h"
 
 #include <SDL3/SDL.h>
@@ -25,7 +27,10 @@ constexpr int kPanelCollapsedHeight = 148;
 constexpr int kPanelApiKeyHeight = 188;
 constexpr int kPanelExpandedHeight = 282;
 constexpr int kUsageRowHeight = 44;
-constexpr int kProviderCount = 3;
+constexpr int kProviderCount = 4;
+constexpr int kTabCount = 3;
+constexpr int kProviderMenuRowHeight = 24;
+constexpr int kProviderMenuWidth = 126;
 
 struct Rect {
     float x = 0;
@@ -59,6 +64,7 @@ struct ProviderState {
 struct AppState {
     std::mutex mutex;
     ProviderState providers[kProviderCount];
+    int tab_providers[kTabCount] = {0, 1, 2};
     int selected = 0;
 };
 
@@ -79,6 +85,10 @@ struct UiState {
     bool drawer_open = false;
     bool api_key_mode = false;
     bool api_input_focused = false;
+    bool oauth_code_mode = false;
+    bool oauth_code_input_focused = false;
+    bool provider_menu_open = false;
+    int provider_menu_tab = -1;
     bool dragging = false;
     bool drag_moved = false;
     int drag_offset_x = 0;
@@ -89,10 +99,14 @@ struct UiState {
     long long shown_at_ms = 0;
     double drawer_anim = 0.0;
     std::string api_key_input;
+    std::string oauth_code_input;
+    OAuthLoginSession oauth_session;
     Rect gpt_tab, claude_tab, glm_tab;
     Rect top_refresh_button, pin_button, drawer_button;
     Rect login_button, refresh_button, warm_button, logout_button, quit_button;
     Rect api_input, api_ok, api_cancel;
+    Rect oauth_code_input_box, oauth_code_ok, oauth_code_cancel;
+    Rect provider_menu_rect, provider_menu_options[kProviderCount];
 };
 
 AppState g_app;
@@ -120,29 +134,31 @@ long long now_ms() {
 }
 
 const char* provider_key(int index) {
+    if (index == 3) return "gemini";
     if (index == 2) return "glm";
     return index == 1 ? "anthropic" : "openai";
 }
 
 const char* provider_label(int index) {
+    if (index == 3) return "Gemini";
     if (index == 2) return "GLM";
     return index == 1 ? "Claude" : "GPT";
 }
 
 const char* primary_label(int index) {
-    return index == 2 ? "5h" : "5h";
+    return index == 3 ? "Pro" : "5h";
 }
 
 const char* secondary_label(int index) {
-    return "Weekly";
+    return index == 3 ? "Flash" : "Weekly";
 }
 
 const char* primary_row_label(int index) {
-    return "5 hour";
+    return index == 3 ? "Pro" : "5 hour";
 }
 
 const char* secondary_row_label(int index) {
-    return "Weekly";
+    return index == 3 ? "Flash" : "Weekly";
 }
 
 std::string openai_row_label(const RateWindow& window, const char* fallback) {
@@ -153,6 +169,10 @@ std::string openai_row_label(const RateWindow& window, const char* fallback) {
 
 bool provider_has_auth(int index) {
     return index == 2 ? load_api_key_provider("glm").has_value() : load_credentials_provider(provider_key(index)).has_value();
+}
+
+Rect& tab_rect(int index) {
+    return index == 0 ? g_ui.gpt_tab : (index == 1 ? g_ui.claude_tab : g_ui.glm_tab);
 }
 
 std::string trim_copy(std::string value) {
@@ -177,9 +197,18 @@ bool contains(Rect r, float x, float y) {
     return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 }
 
+int tab_index_at(float x, float y) {
+    for (int i = 0; i < kTabCount; ++i) if (contains(tab_rect(i), x, y)) return i;
+    return -1;
+}
+
 bool over_click_target(float x, float y) {
+    if (g_ui.provider_menu_open) return true;
     if (g_ui.api_key_mode) {
         return contains(g_ui.api_input, x, y) || contains(g_ui.api_ok, x, y) || contains(g_ui.api_cancel, x, y);
+    }
+    if (g_ui.oauth_code_mode) {
+        return contains(g_ui.oauth_code_input_box, x, y) || contains(g_ui.oauth_code_ok, x, y) || contains(g_ui.oauth_code_cancel, x, y);
     }
     if (contains(g_ui.gpt_tab, x, y) || contains(g_ui.claude_tab, x, y) || contains(g_ui.glm_tab, x, y)) return true;
     if (contains(g_ui.top_refresh_button, x, y) || contains(g_ui.pin_button, x, y) || contains(g_ui.drawer_button, x, y)) return true;
@@ -357,6 +386,9 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             } else if (provider_index == 2) {
                 state.account = "GLM API key";
                 state.account_label = "GLM";
+            } else if (provider_index == 3) {
+                state.account = info.email.empty() ? "Gemini" : info.email;
+                state.account_label = "Gemini";
             } else {
                 state.account = info.email.empty() ? plan : info.email + " (" + plan + ")";
                 state.account_label = plan.empty() ? "GPT" : plan;
@@ -364,8 +396,8 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             state.primary = format_usage_line(primary_label(provider_index), info.primary);
             state.secondary = format_usage_line(secondary_label(provider_index), info.secondary);
             state.tertiary = format_usage_line("Requests", info.tertiary);
-            state.primary_row = provider_index == 0 ? openai_row_label(info.primary, primary_row_label(provider_index)) : primary_row_label(provider_index);
-            state.secondary_row = provider_index == 0 ? openai_row_label(info.secondary, secondary_row_label(provider_index)) : secondary_row_label(provider_index);
+            state.primary_row = provider_index == 0 || provider_index == 3 ? openai_row_label(info.primary, primary_row_label(provider_index)) : primary_row_label(provider_index);
+            state.secondary_row = provider_index == 0 || provider_index == 3 ? openai_row_label(info.secondary, secondary_row_label(provider_index)) : secondary_row_label(provider_index);
             state.tertiary_row = "Requests";
             state.primary_available = info.primary.available;
             state.secondary_available = info.secondary.available;
@@ -385,6 +417,92 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             state.busy = false;
         }
     }).detach();
+}
+
+std::string compact_code(std::string value) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) { return std::isspace(c); }), value.end());
+    return value;
+}
+
+void cancel_gemini_login() {
+    g_ui.oauth_code_mode = false;
+    g_ui.oauth_code_input_focused = false;
+    g_ui.oauth_code_input.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        auto& state = g_app.providers[3];
+        ++state.operation_id;
+        state.busy = false;
+        state.status = "Login canceled";
+    }
+    set_target_height(wanted_panel_height());
+    SDL_StopTextInput(g_ui.window);
+}
+
+void save_gemini_code() {
+    std::string code = compact_code(g_ui.oauth_code_input);
+    if (code.empty()) return;
+    OAuthLoginSession session = g_ui.oauth_session;
+    g_ui.oauth_code_mode = false;
+    g_ui.oauth_code_input_focused = false;
+    g_ui.oauth_code_input.clear();
+    unsigned long long operation_id;
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        auto& state = g_app.providers[3];
+        operation_id = ++state.operation_id;
+        state.busy = true;
+        state.status = "Verifying Gemini...";
+    }
+    set_target_height(wanted_panel_height());
+    SDL_StopTextInput(g_ui.window);
+    std::thread([code, session, operation_id] {
+        try {
+            OAuthCredentials credentials = oauth_finish_manual_login_provider(session, code);
+            {
+                std::lock_guard<std::mutex> lock(g_app.mutex);
+                auto& state = g_app.providers[3];
+                if (state.operation_id != operation_id) return;
+                state.logged_in = true;
+                state.account = "Gemini";
+                state.account_label = "Gemini";
+                state.status = "Login complete";
+                state.busy = false;
+                state.last_refresh_ms = 0;
+            }
+            refresh_usage_async_for(3, true);
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lock(g_app.mutex);
+            auto& state = g_app.providers[3];
+            if (state.operation_id != operation_id) return;
+            state.status = e.what();
+            state.busy = false;
+        }
+    }).detach();
+}
+
+void begin_gemini_login() {
+    try {
+        OAuthLoginSession session = oauth_begin_manual_login_provider("gemini");
+        {
+            std::lock_guard<std::mutex> lock(g_app.mutex);
+            auto& state = g_app.providers[3];
+            if (state.busy || state.logged_in) return;
+            ++state.operation_id;
+            state.busy = true;
+            state.status = "Waiting for Gemini verification code...";
+        }
+        g_ui.oauth_session = std::move(session);
+        g_ui.oauth_code_mode = true;
+        g_ui.oauth_code_input_focused = true;
+        g_ui.oauth_code_input.clear();
+        set_target_height(kPanelApiKeyHeight);
+        SDL_StartTextInput(g_ui.window);
+        if (!g_ui.visible) show_panel();
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        g_app.providers[3].status = e.what();
+    }
 }
 
 void warm_async_for(int provider_index) {
@@ -421,6 +539,10 @@ void warm_async_for(int provider_index) {
 }
 
 void login_async_for(int provider_index) {
+    if (provider_index == 3) {
+        begin_gemini_login();
+        return;
+    }
     if (provider_index == 2) {
         if (g_ui.visible) anchor_current_bottom();
         g_ui.api_key_mode = true;
@@ -797,6 +919,22 @@ void draw_account_info(Rect r) {
     button(r, "i", true);
 }
 
+void draw_provider_menu(const int* tab_providers) {
+    if (!g_ui.provider_menu_open || g_ui.provider_menu_tab < 0 || g_ui.provider_menu_tab >= kTabCount) return;
+    Rect anchor = tab_rect(g_ui.provider_menu_tab);
+    float x = std::min(anchor.x, static_cast<float>(kPanelWidth - kProviderMenuWidth - 4));
+    float y = anchor.y + anchor.h + 4;
+    float h = 8.0f + kProviderCount * static_cast<float>(kProviderMenuRowHeight);
+    g_ui.provider_menu_rect = {x, y, static_cast<float>(kProviderMenuWidth), h};
+    fill(g_ui.provider_menu_rect, 26, 31, 33);
+    outline(g_ui.provider_menu_rect, 82, 96, 90);
+    for (int i = 0; i < kProviderCount; ++i) {
+        Rect option{x + 4, y + 4 + i * static_cast<float>(kProviderMenuRowHeight), static_cast<float>(kProviderMenuWidth - 8), static_cast<float>(kProviderMenuRowHeight - 2)};
+        g_ui.provider_menu_options[i] = option;
+        button(option, provider_label(i), true);
+    }
+}
+
 void draw_panel() {
     set_color(0, 0, 0, 0);
     SDL_RenderClear(g_ui.renderer);
@@ -807,6 +945,7 @@ void draw_panel() {
     fill({10, 2, static_cast<float>(kPanelWidth - 20), 1}, 70, 82, 84, 92);
 
     int selected;
+    int tab_providers[kTabCount]{};
     bool busy, logged_in;
     std::string status, primary, secondary, tertiary, primary_row, secondary_row, tertiary_row;
     bool primary_available, secondary_available, tertiary_available;
@@ -814,6 +953,7 @@ void draw_panel() {
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         selected = g_app.selected;
+        for (int i = 0; i < kTabCount; ++i) tab_providers[i] = g_app.tab_providers[i];
         const auto& state = g_app.providers[selected];
         busy = state.busy;
         logged_in = state.logged_in;
@@ -834,10 +974,8 @@ void draw_panel() {
 
     g_ui.gpt_tab = {10, 12, 46, 24};
     g_ui.claude_tab = {62, 12, 62, 24};
-    g_ui.glm_tab = {130, 12, 46, 24};
-    tab(g_ui.gpt_tab, "GPT", selected == 0);
-    tab(g_ui.claude_tab, "Claude", selected == 1);
-    tab(g_ui.glm_tab, "GLM", selected == 2);
+    g_ui.glm_tab = {130, 12, 70, 24};
+    for (int i = 0; i < kTabCount; ++i) tab(tab_rect(i), provider_label(tab_providers[i]), selected == tab_providers[i]);
 
     g_ui.top_refresh_button = {216, 12, 24, 24};
     g_ui.pin_button = {244, 12, 24, 24};
@@ -867,6 +1005,27 @@ void draw_panel() {
         return;
     }
 
+    if (g_ui.oauth_code_mode) {
+        text(10, 52, "Gemini verification code");
+        text(10, 72, "Paste the code shown by Antigravity.", 174, 184, 179);
+        g_ui.oauth_code_input_box = {10, 100, 280, 28};
+        fill(g_ui.oauth_code_input_box, 30, 35, 38);
+        outline(g_ui.oauth_code_input_box, g_ui.oauth_code_input_focused ? 123 : 82, g_ui.oauth_code_input_focused ? 222 : 172, g_ui.oauth_code_input_focused ? 159 : 123);
+        std::string masked(g_ui.oauth_code_input.size(), '*');
+        text(g_ui.oauth_code_input_box.x + 8, g_ui.oauth_code_input_box.y + 8, masked);
+        if (g_ui.oauth_code_input_focused && ((SDL_GetTicks() / 500) % 2 == 0)) {
+            auto [tw, th] = measure_text(masked);
+            float cx = std::min(g_ui.oauth_code_input_box.x + 8 + static_cast<float>(tw) + 2.0f, g_ui.oauth_code_input_box.x + g_ui.oauth_code_input_box.w - 10.0f);
+            fill({cx, g_ui.oauth_code_input_box.y + 6, 1.5f, 16}, 231, 238, 234);
+        }
+        g_ui.oauth_code_ok = {10, 142, 128, 28};
+        g_ui.oauth_code_cancel = {152, 142, 138, 28};
+        button(g_ui.oauth_code_ok, "Verify", !g_ui.oauth_code_input.empty());
+        button(g_ui.oauth_code_cancel, "Cancel", true);
+        SDL_RenderPresent(g_ui.renderer);
+        return;
+    }
+
     float usage_y = 46;
     if (primary_available) {
         usage_bar(10, usage_y, 280, primary_row, primary, primary_left, false);
@@ -891,10 +1050,11 @@ void draw_panel() {
     if (g_ui.drawer_open) {
         button(g_ui.login_button, logged_in ? (selected == 2 ? "Key saved" : "Logged in") : (selected == 2 ? "Set API key" : "Login"), !busy && !logged_in);
         button(g_ui.refresh_button, busy ? "Refreshing..." : "Refresh now", !busy && logged_in);
-        button(g_ui.warm_button, busy ? "Working..." : "Warm now", !busy && logged_in);
+        button(g_ui.warm_button, selected == 3 ? "Unavailable" : (busy ? "Working..." : "Warm now"), !busy && logged_in && selected != 3);
         button(g_ui.logout_button, "Logout", logged_in);
         button(g_ui.quit_button, "Quit", true);
     }
+    draw_provider_menu(tab_providers);
     SDL_RenderPresent(g_ui.renderer);
 }
 
@@ -953,7 +1113,56 @@ void create_tray() {
     }
 }
 
+void select_provider_for_tab(int tab_index, int provider_index) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        int previous = g_app.tab_providers[tab_index];
+        if (previous != provider_index) {
+            for (int i = 0; i < kTabCount; ++i) {
+                if (i != tab_index && g_app.tab_providers[i] == provider_index) {
+                    g_app.tab_providers[i] = previous;
+                    break;
+                }
+            }
+            g_app.tab_providers[tab_index] = provider_index;
+            changed = true;
+        }
+        g_app.selected = provider_index;
+    }
+    if (changed) {
+        std::string json = "{";
+        for (int i = 0; i < kTabCount; ++i) {
+            if (i) json += ",";
+            std::lock_guard<std::mutex> lock(g_app.mutex);
+            json += "\"tab" + std::to_string(i) + "\":" + std::to_string(g_app.tab_providers[i]);
+        }
+        json += "}";
+        try { credential_save_named("layout", json); } catch (const std::exception&) { }
+    }
+}
+
+void handle_right_click(float x, float y) {
+    if (g_ui.api_key_mode || g_ui.oauth_code_mode) return;
+    int tab_index = tab_index_at(x, y);
+    if (tab_index >= 0) {
+        g_ui.provider_menu_open = true;
+        g_ui.provider_menu_tab = tab_index;
+    } else {
+        g_ui.provider_menu_open = false;
+        g_ui.provider_menu_tab = -1;
+    }
+}
+
 void handle_click(float x, float y) {
+    if (g_ui.provider_menu_open) {
+        int provider_index = -1;
+        for (int i = 0; i < kProviderCount; ++i) if (contains(g_ui.provider_menu_options[i], x, y)) { provider_index = i; break; }
+        if (provider_index >= 0) select_provider_for_tab(g_ui.provider_menu_tab, provider_index);
+        g_ui.provider_menu_open = false;
+        g_ui.provider_menu_tab = -1;
+        return;
+    }
     if (g_ui.api_key_mode) {
         if (contains(g_ui.api_input, x, y)) {
             g_ui.api_input_focused = true;
@@ -968,6 +1177,15 @@ void handle_click(float x, float y) {
         return;
     }
 
+    if (g_ui.oauth_code_mode) {
+        if (contains(g_ui.oauth_code_input_box, x, y)) {
+            g_ui.oauth_code_input_focused = true;
+            SDL_StartTextInput(g_ui.window);
+        } else if (contains(g_ui.oauth_code_ok, x, y)) save_gemini_code();
+        else if (contains(g_ui.oauth_code_cancel, x, y)) cancel_gemini_login();
+        return;
+    }
+
     int selected = selected_provider();
     bool busy, logged_in;
     {
@@ -976,9 +1194,10 @@ void handle_click(float x, float y) {
         logged_in = g_app.providers[selected].logged_in;
     }
 
-    if (contains(g_ui.gpt_tab, x, y) || contains(g_ui.claude_tab, x, y) || contains(g_ui.glm_tab, x, y)) {
+    int tab_index = tab_index_at(x, y);
+    if (tab_index >= 0) {
         std::lock_guard<std::mutex> lock(g_app.mutex);
-        g_app.selected = contains(g_ui.glm_tab, x, y) ? 2 : (contains(g_ui.claude_tab, x, y) ? 1 : 0);
+        g_app.selected = g_app.tab_providers[tab_index];
     } else if (contains(g_ui.top_refresh_button, x, y) && !busy && logged_in) {
         refresh_usage_async_for(selected, true);
     } else if (contains(g_ui.pin_button, x, y)) {
@@ -991,7 +1210,7 @@ void handle_click(float x, float y) {
         login_async_for(selected);
     } else if (g_ui.drawer_open && contains(g_ui.refresh_button, x, y) && !busy && logged_in) {
         refresh_usage_async_for(selected, true);
-    } else if (g_ui.drawer_open && contains(g_ui.warm_button, x, y) && !busy && logged_in) {
+    } else if (g_ui.drawer_open && contains(g_ui.warm_button, x, y) && !busy && logged_in && selected != 3) {
         warm_async_for(selected);
     } else if (g_ui.drawer_open && contains(g_ui.logout_button, x, y) && logged_in) {
         clear_credentials_provider(provider_key(selected));
@@ -1049,7 +1268,25 @@ void handle_mouse_up(float x, float y) {
     if (!was_dragging || !moved) handle_click(x, y);
 }
 
+void load_tab_layout() {
+    auto raw = credential_load_named("layout");
+    if (!raw) return;
+    int slots[kTabCount]{};
+    bool valid = true;
+    for (int i = 0; i < kTabCount; ++i) {
+        std::string key = "tab" + std::to_string(i);
+        auto value = json_number(*raw, key);
+        slots[i] = value ? static_cast<int>(*value) : -1;
+        if (slots[i] < 0 || slots[i] >= kProviderCount) valid = false;
+        for (int j = 0; j < i; ++j) if (slots[j] == slots[i]) valid = false;
+    }
+    if (!valid) return;
+    std::lock_guard<std::mutex> lock(g_app.mutex);
+    for (int i = 0; i < kTabCount; ++i) g_app.tab_providers[i] = slots[i];
+}
+
 void init_state() {
+    load_tab_layout();
     std::lock_guard<std::mutex> lock(g_app.mutex);
     for (int i = 0; i < kProviderCount; ++i) {
         auto& state = g_app.providers[i];
@@ -1064,6 +1301,11 @@ void init_state() {
             state.account_label = state.logged_in ? "GLM" : "";
             state.primary = "5h: unknown";
             state.secondary = "Requests: unknown";
+        } else if (i == 3) {
+            state.account = state.logged_in ? "Gemini" : "";
+            state.account_label = state.logged_in ? "Gemini" : "";
+            state.primary = "Pro: unknown";
+            state.secondary = "Flash: unknown";
         }
     }
 }
@@ -1136,6 +1378,7 @@ int main(int, char**) {
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) g_quit = true;
             else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) handle_mouse_down(logical_coordinate(event.button.x), logical_coordinate(event.button.y));
+            else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_RIGHT) handle_right_click(logical_coordinate(event.button.x), logical_coordinate(event.button.y));
             else if (event.type == SDL_EVENT_MOUSE_MOTION) handle_mouse_motion();
             else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) handle_mouse_up(logical_coordinate(event.button.x), logical_coordinate(event.button.y));
             else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
@@ -1147,7 +1390,9 @@ int main(int, char**) {
             }
             else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) update_render_metrics();
             else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.api_key_mode && g_ui.api_input_focused) g_ui.api_key_input += event.text.text;
-            else if (event.type == SDL_EVENT_KEY_DOWN && g_ui.api_key_mode) {
+            else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.oauth_code_mode && g_ui.oauth_code_input_focused) g_ui.oauth_code_input += event.text.text;
+            else if (event.type == SDL_EVENT_KEY_DOWN && (g_ui.api_key_mode || g_ui.oauth_code_mode)) {
+                bool oauth_code = g_ui.oauth_code_mode;
                 bool paste = ((event.key.mod & SDL_KMOD_CTRL) && event.key.key == SDLK_V) ||
                     ((event.key.mod & SDL_KMOD_SHIFT) && event.key.key == SDLK_INSERT);
                 if (paste) {
@@ -1155,16 +1400,25 @@ int main(int, char**) {
                     if (clip) {
                         std::string pasted = trim_copy(clip);
                         SDL_free(clip);
-                        g_ui.api_key_input += pasted;
-                        g_ui.api_input_focused = true;
+                        if (oauth_code) g_ui.oauth_code_input += compact_code(pasted);
+                        else g_ui.api_key_input += pasted;
+                        if (oauth_code) g_ui.oauth_code_input_focused = true;
+                        else g_ui.api_input_focused = true;
                     }
-                } else if (event.key.key == SDLK_BACKSPACE && !g_ui.api_key_input.empty() && g_ui.api_input_focused) g_ui.api_key_input.pop_back();
-                else if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) save_glm_key();
+                } else if (event.key.key == SDLK_BACKSPACE && oauth_code && !g_ui.oauth_code_input.empty() && g_ui.oauth_code_input_focused) g_ui.oauth_code_input.pop_back();
+                else if (event.key.key == SDLK_BACKSPACE && !oauth_code && !g_ui.api_key_input.empty() && g_ui.api_input_focused) g_ui.api_key_input.pop_back();
+                else if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
+                    if (oauth_code) save_gemini_code();
+                    else save_glm_key();
+                }
                 else if (event.key.key == SDLK_ESCAPE) {
-                    g_ui.api_key_mode = false;
-                    g_ui.api_input_focused = false;
-                    set_target_height(wanted_panel_height());
-                    SDL_StopTextInput(g_ui.window);
+                    if (oauth_code) cancel_gemini_login();
+                    else {
+                        g_ui.api_key_mode = false;
+                        g_ui.api_input_focused = false;
+                        set_target_height(wanted_panel_height());
+                        SDL_StopTextInput(g_ui.window);
+                    }
                 }
             }
         }

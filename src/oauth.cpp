@@ -7,6 +7,7 @@
 #include "platform.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <map>
 #include <stdexcept>
@@ -23,6 +24,26 @@ static constexpr const char* kAnthropicAuthorizeUrl = "https://claude.ai/oauth/a
 static constexpr const char* kAnthropicTokenUrl = "https://platform.claude.com/v1/oauth/token";
 static constexpr const char* kAnthropicRedirectUri = "http://localhost:53692/callback";
 static constexpr const char* kAnthropicScope = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+
+static constexpr const char* kGeminiAuthorizeUrl = "https://accounts.google.com/o/oauth2/auth";
+static constexpr const char* kGeminiTokenUrl = "https://oauth2.googleapis.com/token";
+static constexpr const char* kGeminiRedirectUri = "https://antigravity.google/oauth-callback";
+static constexpr const char* kGeminiScope = "email profile https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs https://www.googleapis.com/auth/aicode openid";
+static constexpr const char* kGeminiCodeAssistUrl = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+
+struct GeminiOAuthConfig {
+    std::string client_id;
+    std::string client_secret;
+};
+
+static GeminiOAuthConfig gemini_oauth_config() {
+    const char* client_id = std::getenv("LLM_USAGE_TRAY_GEMINI_CLIENT_ID");
+    const char* client_secret = std::getenv("LLM_USAGE_TRAY_GEMINI_CLIENT_SECRET");
+    if (!client_id || !*client_id || !client_secret || !*client_secret) {
+        throw std::runtime_error("Set LLM_USAGE_TRAY_GEMINI_CLIENT_ID and LLM_USAGE_TRAY_GEMINI_CLIENT_SECRET before Gemini login");
+    }
+    return {client_id, client_secret};
+}
 
 static long long now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -68,6 +89,20 @@ static std::string create_anthropic_authorize_url(const std::string& challenge, 
     url += "&scope=" + url_escape(kAnthropicScope);
     url += "&code_challenge=" + url_escape(challenge);
     url += "&code_challenge_method=S256";
+    url += "&state=" + url_escape(state);
+    return url;
+}
+
+static std::string create_gemini_authorize_url(const std::string& client_id, const std::string& challenge, const std::string& state) {
+    std::string url = kGeminiAuthorizeUrl;
+    url += "?access_type=offline";
+    url += "&client_id=" + url_escape(client_id);
+    url += "&code_challenge=" + url_escape(challenge);
+    url += "&code_challenge_method=S256";
+    url += "&prompt=consent";
+    url += "&redirect_uri=" + url_escape(kGeminiRedirectUri);
+    url += "&response_type=code";
+    url += "&scope=" + url_escape(kGeminiScope);
     url += "&state=" + url_escape(state);
     return url;
 }
@@ -134,6 +169,45 @@ static OAuthCredentials exchange_anthropic_code(const std::string& code, const s
     return credentials;
 }
 
+static OAuthCredentials exchange_gemini_code(const std::string& code, const std::string& verifier, const GeminiOAuthConfig& config) {
+    HttpResponse res = http_post_form(kGeminiTokenUrl, {
+        {"grant_type", "authorization_code"},
+        {"client_id", config.client_id},
+        {"client_secret", config.client_secret},
+        {"code", code},
+        {"code_verifier", verifier},
+        {"redirect_uri", kGeminiRedirectUri},
+    });
+    if (res.status < 200 || res.status >= 300) {
+        throw std::runtime_error("Gemini token exchange failed: HTTP " + std::to_string(res.status));
+    }
+    std::string access = json_string(res.body, "access_token").value_or("");
+    std::string refresh = json_string(res.body, "refresh_token").value_or("");
+    double expires_in = json_number(res.body, "expires_in").value_or(0);
+    if (access.empty() || refresh.empty() || expires_in <= 0) {
+        throw std::runtime_error("Gemini token response missing access_token, refresh_token, or expires_in");
+    }
+    OAuthCredentials credentials;
+    credentials.access = access;
+    credentials.refresh = refresh;
+    credentials.expires_ms = now_ms() + static_cast<long long>(expires_in * 1000.0);
+    return credentials;
+}
+
+std::string gemini_discover_project(const std::string& access_token) {
+    std::string body = "{\"metadata\":{\"ideType\":\"ANTIGRAVITY\"}}";
+    HttpResponse res = http_post_json(kGeminiCodeAssistUrl, body, {
+        {"Authorization", "Bearer " + access_token},
+        {"User-Agent", "antigravity/1.1.24"},
+    });
+    if (res.status < 200 || res.status >= 300) {
+        throw std::runtime_error("Gemini project discovery failed: HTTP " + std::to_string(res.status));
+    }
+    std::string project = json_string(res.body, "cloudaicompanionProject").value_or("");
+    if (project.empty()) throw std::runtime_error("Gemini project discovery returned no project");
+    return project;
+}
+
 OAuthCredentials oauth_login_browser() {
     return oauth_login_browser_provider("openai");
 }
@@ -165,6 +239,30 @@ OAuthCredentials oauth_login_browser_provider(const std::string& provider) {
     return credentials;
 }
 
+OAuthLoginSession oauth_begin_manual_login_provider(const std::string& provider) {
+    if (provider != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini");
+    GeminiOAuthConfig config = gemini_oauth_config();
+    OAuthLoginSession session;
+    session.provider = provider;
+    session.verifier = base64url_encode(random_bytes(32));
+    session.state = base64url_encode(random_bytes(16));
+    session.client_id = config.client_id;
+    session.client_secret = config.client_secret;
+    session.authorize_url = create_gemini_authorize_url(config.client_id, base64url_encode(sha256_bytes(session.verifier)), session.state);
+    open_browser(session.authorize_url);
+    return session;
+}
+
+OAuthCredentials oauth_finish_manual_login_provider(const OAuthLoginSession& session, const std::string& code) {
+    if (session.provider != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini");
+    if (session.client_id.empty() || session.client_secret.empty()) throw std::runtime_error("Gemini OAuth session is missing client configuration");
+    GeminiOAuthConfig config{session.client_id, session.client_secret};
+    OAuthCredentials credentials = exchange_gemini_code(code, session.verifier, config);
+    credentials.account_id = gemini_discover_project(credentials.access);
+    save_credentials_provider(session.provider, credentials);
+    return credentials;
+}
+
 OAuthCredentials oauth_refresh(const std::string& refresh_token) {
     return oauth_refresh_provider("openai", refresh_token);
 }
@@ -193,6 +291,30 @@ OAuthCredentials oauth_refresh_provider(const std::string& provider, const std::
         credentials.access = access;
         credentials.refresh = refresh;
         credentials.expires_ms = now_ms() + static_cast<long long>(expires_in * 1000.0) - 5 * 60 * 1000;
+        save_credentials_provider(provider, credentials);
+        return credentials;
+    }
+    if (provider == "gemini") {
+        GeminiOAuthConfig config = gemini_oauth_config();
+        HttpResponse res = http_post_form(kGeminiTokenUrl, {
+            {"grant_type", "refresh_token"},
+            {"client_id", config.client_id},
+            {"client_secret", config.client_secret},
+            {"refresh_token", refresh_token},
+        });
+        if (res.status < 200 || res.status >= 300) {
+            throw std::runtime_error("Gemini token refresh failed: HTTP " + std::to_string(res.status));
+        }
+        std::string access = json_string(res.body, "access_token").value_or("");
+        std::string refresh = json_string(res.body, "refresh_token").value_or(refresh_token);
+        double expires_in = json_number(res.body, "expires_in").value_or(0);
+        if (access.empty() || refresh.empty() || expires_in <= 0) {
+            throw std::runtime_error("Gemini refresh response missing fields");
+        }
+        OAuthCredentials credentials;
+        credentials.access = access;
+        credentials.refresh = refresh;
+        credentials.expires_ms = now_ms() + static_cast<long long>(expires_in * 1000.0);
         save_credentials_provider(provider, credentials);
         return credentials;
     }
