@@ -1,4 +1,4 @@
-# LLM Usage Tray
+# Cross-provider quota monitor
 
 Small C++/SDL tray app for watching LLM quota windows without opening each
 provider's settings page.
@@ -10,6 +10,7 @@ provider's settings page.
 | GPT/Codex | Browser OAuth via ChatGPT | 5 hour, weekly |
 | Claude | Browser OAuth via Anthropic | 5 hour, weekly |
 | GLM/Z.ai | Saved API key | 5 hour quota, MCP/tool requests |
+| Gemini/Antigravity | Google OAuth with hosted verification code | 5 hour, weekly |
 
 ## Platform Status
 
@@ -22,8 +23,8 @@ Backend notes:
 
 ## Security
 
-The tray UI never prints access tokens. GPT and Claude use OAuth tokens; GLM
-stores only the API key you enter.
+The tray UI never prints access tokens. GPT, Claude, and Gemini use OAuth tokens;
+GLM stores only the API key you enter.
 
 ## Build
 
@@ -65,7 +66,7 @@ Run `LLMUsageTray.exe`. It starts in the system tray.
 
 The popup includes:
 
-- provider tabs for GPT, Claude, and GLM
+- provider tabs for GPT, Claude, GLM, and Gemini; right-click a tab to swap its provider
 - progress bars with compact reset times
 - pin button to keep the popup open
 - drawer actions for login, refresh, warm, logout, and quit
@@ -98,6 +99,20 @@ Authorization: Bearer <key>
 - Usage endpoint: `https://api.anthropic.com/api/oauth/usage`
 - Usage headers include `anthropic-beta: oauth-2025-04-20` and
   `User-Agent: claude/1.0`
+
+Gemini mirrors the Antigravity OAuth flow:
+
+- Google authorization uses the hosted `https://antigravity.google/oauth-callback` page
+- Copy the one-time code shown by that page into the tray's Gemini verification field
+- Quota reads AGY's local `RetrieveUserQuotaSummary` endpoint when AGY is running
+- Environment overrides are `LLM_USAGE_TRAY_GEMINI_CLIENT_ID` and
+  `LLM_USAGE_TRAY_GEMINI_CLIENT_SECRET`; otherwise the installed AGY binary is inspected
+
+## Debug
+
+Run `LLMUsageTray.exe --debug` from a terminal. Redacted diagnostics are mirrored to
+the terminal and written to `app.log` beside the executable. Normal launches do not
+emit diagnostics.
 
 ## License
 
