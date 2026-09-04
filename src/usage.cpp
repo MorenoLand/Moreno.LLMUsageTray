@@ -1,9 +1,11 @@
 #include "usage.h"
 
 #include "http_client.h"
+#include "diagnostics.h"
 #include "json_util.h"
 #include "oauth.h"
 #include "base64url.h"
+#include "platform.h"
 
 #include <algorithm>
 #include <cctype>
@@ -50,8 +52,11 @@ static long long parse_iso_or_epoch_reset(const std::string& value) {
     std::tm tm{};
     std::istringstream in(value.substr(0, 19));
     in >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
-    if (in.fail()) return 0;
-    return static_cast<long long>(timegm_portable(&tm));
+    if (!in.fail()) return static_cast<long long>(timegm_portable(&tm));
+    tm = {};
+    std::istringstream local_in(value.substr(0, 19));
+    local_in >> std::get_time(&tm, "%m/%d/%Y %H:%M:%S");
+    return local_in.fail() ? 0 : static_cast<long long>(std::mktime(&tm));
 }
 
 static std::string object_for_key(const std::string& body, const std::string& key) {
@@ -257,7 +262,8 @@ static RateWindow parse_gemini_window(const std::string& object) {
     RateWindow window;
     window.available = true;
     window.used_percent = (1.0 - std::clamp(*remaining, 0.0, 1.0)) * 100.0;
-    window.reset_at = parse_iso_or_epoch_reset(json_string(object, "resetTime").value_or(""));
+    if (auto reset_at = json_number(object, "resetTime")) window.reset_at = static_cast<long long>(*reset_at);
+    else window.reset_at = parse_iso_or_epoch_reset(json_string(object, "resetTime").value_or(""));
     return window;
 }
 
@@ -298,26 +304,26 @@ static UsageInfo parse_gemini_summary(const std::string& body) {
     UsageInfo info;
     info.plan_type = "Gemini";
     std::vector<std::string> groups = objects_in_array(array_for_key(body, "groups"));
-    bool has_named_group = false;
-    bool has_gemini_group = false;
-    for (const std::string& group : groups) {
-        std::string group_name = json_string(group, "displayName").value_or("");
-        if (!group_name.empty()) has_named_group = true;
-        std::transform(group_name.begin(), group_name.end(), group_name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (group_name.find("gemini") != std::string::npos) has_gemini_group = true;
-    }
-    if (has_named_group && !has_gemini_group) throw std::runtime_error("Gemini quota summary contained no Gemini group");
     for (const std::string& group : groups) {
         std::string group_name = json_string(group, "displayName").value_or("");
         std::string lower_group = group_name;
         std::transform(lower_group.begin(), lower_group.end(), lower_group.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (has_gemini_group && lower_group.find("gemini") == std::string::npos) continue;
+        bool group_is_gemini = lower_group.find("gemini") != std::string::npos;
+        diagnostics_log("gemini summary group=" + (group_name.empty() ? std::string("<unnamed>") : group_name));
         for (const std::string& bucket : objects_in_array(array_for_key(group, "buckets"))) {
             RateWindow window = parse_gemini_window(bucket);
             if (!window.available) continue;
-            std::string kind = json_string(bucket, "window").value_or("") + " " + json_string(bucket, "displayName").value_or("");
+            std::string bucket_id = json_string(bucket, "bucketId").value_or("");
+            std::string kind = json_string(bucket, "window").value_or("") + " " + json_string(bucket, "displayName").value_or("") + " " + bucket_id;
             std::transform(kind.begin(), kind.end(), kind.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if ((kind.find("5") != std::string::npos || kind.find("hour") != std::string::npos) && !info.primary.available) {
+            bool bucket_is_gemini = kind.find("gemini") != std::string::npos;
+            diagnostics_log("gemini summary bucket=" + (bucket_id.empty() ? std::string("<unnamed>") : bucket_id) + " kind=" + kind + " selected=" + std::string(group_is_gemini || bucket_is_gemini ? "true" : "false"));
+            if (!group_is_gemini && !bucket_is_gemini) continue;
+            if (kind.find("pro") != std::string::npos) {
+                if (!info.primary.available) info.primary = window;
+            } else if (kind.find("flash") != std::string::npos) {
+                if (!info.secondary.available) info.secondary = window;
+            } else if ((kind.find("5") != std::string::npos || kind.find("hour") != std::string::npos) && !info.primary.available) {
                 window.limit_window_seconds = 5 * 60 * 60;
                 info.primary = window;
             } else if ((kind.find("week") != std::string::npos || kind.find("seven") != std::string::npos || kind.find("day") != std::string::npos) && !info.secondary.available) {
@@ -328,6 +334,7 @@ static UsageInfo parse_gemini_summary(const std::string& body) {
             }
         }
     }
+    diagnostics_log("gemini summary parsed primary=" + std::string(info.primary.available ? "available" : "missing") + " secondary=" + std::string(info.secondary.available ? "available" : "missing") + " primary_used=" + std::to_string(info.primary.used_percent) + " secondary_used=" + std::to_string(info.secondary.used_percent) + " primary_reset=" + std::to_string(info.primary.reset_at) + " secondary_reset=" + std::to_string(info.secondary.reset_at));
     if (!info.primary.available && !info.secondary.available) throw std::runtime_error("Gemini quota summary contained no model windows");
     return info;
 }
@@ -375,6 +382,13 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
     if (!credentials) {
         throw std::runtime_error("Not logged in");
     }
+    if (provider == "gemini") {
+        if (auto local = fetch_agy_local_quota_summary()) {
+            diagnostics_log_raw("agy local quota summary raw_body", *local);
+            return parse_gemini_summary(*local);
+        }
+        diagnostics_log("agy local quota summary unavailable; using remote Cloud Code");
+    }
     if (credentials_expired(*credentials)) {
         credentials = oauth_refresh_provider(provider, credentials->refresh);
     }
@@ -387,17 +401,22 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         std::string body = "{\"project\":\"" + json_escape(credentials->account_id) + "\"}";
         std::map<std::string, std::string> headers = {
             {"Authorization", "Bearer " + credentials->access},
-            {"User-Agent", "antigravity/1.1.24"},
+            {"User-Agent", "antigravity/cli/1.1.24 windows/amd64"},
             {"Client-Metadata", "{\"ideType\":\"ANTIGRAVITY\",\"platform\":\"" + gemini_platform() + "\",\"pluginType\":\"GEMINI\"}"},
         };
         HttpResponse summary = http_post_json(kGeminiQuotaSummaryUrl, body, headers);
+        diagnostics_log("gemini quota summary status=" + std::to_string(summary.status) + " body_length=" + std::to_string(summary.body.size()));
+        diagnostics_log_raw("gemini quota summary raw_body", summary.body);
         if (summary.status >= 200 && summary.status < 300) {
             try {
                 return parse_gemini_summary(summary.body);
-            } catch (const std::exception&) {
+            } catch (const std::exception& error) {
+                diagnostics_log("gemini quota summary parse_error=" + std::string(error.what()));
             }
         }
         HttpResponse res = http_post_json(kGeminiQuotaUrl, body, headers);
+        diagnostics_log("gemini quota legacy status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()));
+        diagnostics_log_raw("gemini quota legacy raw_body", res.body);
         if (res.status < 200 || res.status >= 300) {
             throw std::runtime_error("Gemini quota request failed: HTTP " + std::to_string(res.status));
         }

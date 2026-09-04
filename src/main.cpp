@@ -1,5 +1,6 @@
 #include "oauth.h"
 #include "credential_store.h"
+#include "diagnostics.h"
 #include "json_util.h"
 #include "usage.h"
 
@@ -101,7 +102,7 @@ struct UiState {
     std::string api_key_input;
     std::string oauth_code_input;
     OAuthLoginSession oauth_session;
-    Rect gpt_tab, claude_tab, glm_tab;
+    Rect tabs[kTabCount];
     Rect top_refresh_button, pin_button, drawer_button;
     Rect login_button, refresh_button, warm_button, logout_button, quit_button;
     Rect api_input, api_ok, api_cancel;
@@ -172,7 +173,7 @@ bool provider_has_auth(int index) {
 }
 
 Rect& tab_rect(int index) {
-    return index == 0 ? g_ui.gpt_tab : (index == 1 ? g_ui.claude_tab : g_ui.glm_tab);
+    return g_ui.tabs[std::clamp(index, 0, kTabCount - 1)];
 }
 
 std::string trim_copy(std::string value) {
@@ -193,6 +194,10 @@ std::string pretty_plan(std::string plan) {
     return plan;
 }
 
+bool status_visible(const std::string& status) {
+    return !status.empty() && status != "Updated" && status != "Logged out" && status != "Login complete" && status != "API key saved" && status.rfind("Ready to refresh ", 0) != 0 && status != "Not logged in";
+}
+
 bool contains(Rect r, float x, float y) {
     return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 }
@@ -210,7 +215,7 @@ bool over_click_target(float x, float y) {
     if (g_ui.oauth_code_mode) {
         return contains(g_ui.oauth_code_input_box, x, y) || contains(g_ui.oauth_code_ok, x, y) || contains(g_ui.oauth_code_cancel, x, y);
     }
-    if (contains(g_ui.gpt_tab, x, y) || contains(g_ui.claude_tab, x, y) || contains(g_ui.glm_tab, x, y)) return true;
+    if (tab_index_at(x, y) >= 0) return true;
     if (contains(g_ui.top_refresh_button, x, y) || contains(g_ui.pin_button, x, y) || contains(g_ui.drawer_button, x, y)) return true;
     if (!g_ui.drawer_open) return false;
     return contains(g_ui.login_button, x, y) || contains(g_ui.refresh_button, x, y) ||
@@ -303,7 +308,7 @@ void update_render_metrics(bool reload_fonts = true) {
 }
 
 int wanted_panel_height() {
-    if (g_ui.api_key_mode) return kPanelApiKeyHeight;
+    if (g_ui.api_key_mode || g_ui.oauth_code_mode) return kPanelApiKeyHeight;
     int rows;
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
@@ -354,7 +359,7 @@ void show_panel() {
 }
 
 void hide_panel() {
-    if (!g_ui.pinned && !g_ui.api_key_mode) {
+    if (!g_ui.pinned && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
         g_ui.visible = false;
         SDL_HideWindow(g_ui.window);
     }
@@ -396,8 +401,8 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             state.primary = format_usage_line(primary_label(provider_index), info.primary);
             state.secondary = format_usage_line(secondary_label(provider_index), info.secondary);
             state.tertiary = format_usage_line("Requests", info.tertiary);
-            state.primary_row = provider_index == 0 || provider_index == 3 ? openai_row_label(info.primary, primary_row_label(provider_index)) : primary_row_label(provider_index);
-            state.secondary_row = provider_index == 0 || provider_index == 3 ? openai_row_label(info.secondary, secondary_row_label(provider_index)) : secondary_row_label(provider_index);
+            state.primary_row = provider_index == 3 ? "5 hour" : (provider_index == 0 ? openai_row_label(info.primary, primary_row_label(provider_index)) : primary_row_label(provider_index));
+            state.secondary_row = provider_index == 3 ? "Weekly" : (provider_index == 0 ? openai_row_label(info.secondary, secondary_row_label(provider_index)) : secondary_row_label(provider_index));
             state.tertiary_row = "Requests";
             state.primary_available = info.primary.available;
             state.secondary_available = info.secondary.available;
@@ -408,6 +413,7 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             state.status = "Updated";
             state.last_refresh_ms = now_ms();
             state.busy = false;
+            diagnostics_log("provider refresh success provider=" + std::string(provider_key(provider_index)) + " primary_row=" + state.primary_row + " secondary_row=" + state.secondary_row + " primary_left=" + std::to_string(state.primary_left) + " secondary_left=" + std::to_string(state.secondary_left));
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(g_app.mutex);
             auto& state = g_app.providers[provider_index];
@@ -415,6 +421,7 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             state.logged_in = provider_has_auth(provider_index);
             state.status = e.what();
             state.busy = false;
+            diagnostics_log("provider refresh error provider=" + std::string(provider_key(provider_index)) + " message=" + e.what());
         }
     }).detach();
 }
@@ -477,6 +484,7 @@ void save_gemini_code() {
             if (state.operation_id != operation_id) return;
             state.status = e.what();
             state.busy = false;
+            diagnostics_log("gemini oauth verify error message=" + std::string(e.what()));
         }
     }).detach();
 }
@@ -502,6 +510,7 @@ void begin_gemini_login() {
     } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         g_app.providers[3].status = e.what();
+        diagnostics_log("gemini oauth browser error message=" + std::string(e.what()));
     }
 }
 
@@ -745,6 +754,12 @@ std::string clip_text(const std::string& s, int max_width, bool bold = false) {
     return out.empty() ? "..." : out + "...";
 }
 
+std::string masked_input_text(const std::string& value, int max_width) {
+    std::string masked(value.size(), '*');
+    while (!masked.empty() && measure_text(masked).first > max_width) masked.erase(masked.begin());
+    return masked;
+}
+
 void button(Rect r, const std::string& label, bool enabled = true) {
     aa_round_rect(r, 4,
         color(enabled ? 41 : 35, enabled ? 48 : 39, enabled ? 52 : 42),
@@ -922,16 +937,25 @@ void draw_account_info(Rect r) {
 void draw_provider_menu(const int* tab_providers) {
     if (!g_ui.provider_menu_open || g_ui.provider_menu_tab < 0 || g_ui.provider_menu_tab >= kTabCount) return;
     Rect anchor = tab_rect(g_ui.provider_menu_tab);
-    float x = std::min(anchor.x, static_cast<float>(kPanelWidth - kProviderMenuWidth - 4));
-    float y = anchor.y + anchor.h + 4;
+    float x = std::clamp(anchor.x, 6.0f, static_cast<float>(kPanelWidth - kProviderMenuWidth - 6));
+    float y = anchor.y + anchor.h + 4.0f;
     float h = 8.0f + kProviderCount * static_cast<float>(kProviderMenuRowHeight);
     g_ui.provider_menu_rect = {x, y, static_cast<float>(kProviderMenuWidth), h};
-    fill(g_ui.provider_menu_rect, 26, 31, 33);
-    outline(g_ui.provider_menu_rect, 82, 96, 90);
+    aa_round_rect(g_ui.provider_menu_rect, 6, color(24, 28, 30), color(75, 88, 84));
     for (int i = 0; i < kProviderCount; ++i) {
         Rect option{x + 4, y + 4 + i * static_cast<float>(kProviderMenuRowHeight), static_cast<float>(kProviderMenuWidth - 8), static_cast<float>(kProviderMenuRowHeight - 2)};
         g_ui.provider_menu_options[i] = option;
-        button(option, provider_label(i), true);
+        bool is_current = (i == tab_providers[g_ui.provider_menu_tab]);
+        aa_round_rect(option, 4,
+            color(is_current ? 40 : 31, is_current ? 50 : 36, is_current ? 46 : 39),
+            color(is_current ? 75 : 50, is_current ? 160 : 60, is_current ? 115 : 58));
+        auto [tw, th] = measure_text(provider_label(i));
+        float tx = option.x + 8.0f;
+        float ty = option.y + std::max(2.0f, (option.h - static_cast<float>(th)) / 2.0f);
+        text(tx, ty, provider_label(i), is_current ? 246 : 205, is_current ? 249 : 212, is_current ? 247 : 208);
+        if (is_current) {
+            fill({option.x + option.w - 14.0f, option.y + (option.h - 6.0f) / 2.0f, 6.0f, 6.0f}, 82, 172, 123);
+        }
     }
 }
 
@@ -972,10 +996,10 @@ void draw_panel() {
         tertiary_left = state.tertiary_left;
     }
 
-    g_ui.gpt_tab = {10, 12, 46, 24};
-    g_ui.claude_tab = {62, 12, 62, 24};
-    g_ui.glm_tab = {130, 12, 70, 24};
-    for (int i = 0; i < kTabCount; ++i) tab(tab_rect(i), provider_label(tab_providers[i]), selected == tab_providers[i]);
+    for (int i = 0; i < kTabCount; ++i) {
+        tab_rect(i) = {10.0f + i * 66.0f, 12.0f, 60.0f, 24.0f};
+        tab(tab_rect(i), provider_label(tab_providers[i]), selected == tab_providers[i]);
+    }
 
     g_ui.top_refresh_button = {216, 12, 24, 24};
     g_ui.pin_button = {244, 12, 24, 24};
@@ -990,11 +1014,11 @@ void draw_panel() {
         g_ui.api_input = {10, 100, 280, 28};
         fill(g_ui.api_input, 30, 35, 38);
         outline(g_ui.api_input, g_ui.api_input_focused ? 123 : 82, g_ui.api_input_focused ? 222 : 172, g_ui.api_input_focused ? 159 : 123);
-        std::string masked(g_ui.api_key_input.size(), '*');
+        std::string masked = masked_input_text(g_ui.api_key_input, static_cast<int>(g_ui.api_input.w) - 16);
         text(g_ui.api_input.x + 8, g_ui.api_input.y + 8, masked);
         if (g_ui.api_input_focused && ((SDL_GetTicks() / 500) % 2 == 0)) {
             auto [tw, th] = measure_text(masked);
-            float cx = std::min(g_ui.api_input.x + 8 + static_cast<float>(tw) + 2.0f, g_ui.api_input.x + g_ui.api_input.w - 10.0f);
+            float cx = g_ui.api_input.x + 8 + static_cast<float>(tw) + 2.0f;
             fill({cx, g_ui.api_input.y + 6, 1.5f, 16}, 231, 238, 234);
         }
         g_ui.api_ok = {10, 142, 128, 28};
@@ -1011,11 +1035,11 @@ void draw_panel() {
         g_ui.oauth_code_input_box = {10, 100, 280, 28};
         fill(g_ui.oauth_code_input_box, 30, 35, 38);
         outline(g_ui.oauth_code_input_box, g_ui.oauth_code_input_focused ? 123 : 82, g_ui.oauth_code_input_focused ? 222 : 172, g_ui.oauth_code_input_focused ? 159 : 123);
-        std::string masked(g_ui.oauth_code_input.size(), '*');
+        std::string masked = masked_input_text(g_ui.oauth_code_input, static_cast<int>(g_ui.oauth_code_input_box.w) - 16);
         text(g_ui.oauth_code_input_box.x + 8, g_ui.oauth_code_input_box.y + 8, masked);
         if (g_ui.oauth_code_input_focused && ((SDL_GetTicks() / 500) % 2 == 0)) {
             auto [tw, th] = measure_text(masked);
-            float cx = std::min(g_ui.oauth_code_input_box.x + 8 + static_cast<float>(tw) + 2.0f, g_ui.oauth_code_input_box.x + g_ui.oauth_code_input_box.w - 10.0f);
+            float cx = g_ui.oauth_code_input_box.x + 8 + static_cast<float>(tw) + 2.0f;
             fill({cx, g_ui.oauth_code_input_box.y + 6, 1.5f, 16}, 231, 238, 234);
         }
         g_ui.oauth_code_ok = {10, 142, 128, 28};
@@ -1053,6 +1077,7 @@ void draw_panel() {
         button(g_ui.warm_button, selected == 3 ? "Unavailable" : (busy ? "Working..." : "Warm now"), !busy && logged_in && selected != 3);
         button(g_ui.logout_button, "Logout", logged_in);
         button(g_ui.quit_button, "Quit", true);
+        if (status_visible(status)) text(10, static_cast<float>(g_ui.panel_height - 20), clip_text(status, 280), 174, 184, 179);
     }
     draw_provider_menu(tab_providers);
     SDL_RenderPresent(g_ui.renderer);
@@ -1132,22 +1157,33 @@ void select_provider_for_tab(int tab_index, int provider_index) {
     }
     if (changed) {
         std::string json = "{";
-        for (int i = 0; i < kTabCount; ++i) {
-            if (i) json += ",";
+        {
             std::lock_guard<std::mutex> lock(g_app.mutex);
-            json += "\"tab" + std::to_string(i) + "\":" + std::to_string(g_app.tab_providers[i]);
+            for (int i = 0; i < kTabCount; ++i) {
+                if (i) json += ",";
+                json += "\"tab" + std::to_string(i) + "\":" + std::to_string(g_app.tab_providers[i]);
+            }
         }
         json += "}";
         try { credential_save_named("layout", json); } catch (const std::exception&) { }
     }
+    if (provider_has_auth(provider_index)) {
+        refresh_usage_async_for(provider_index, false);
+    }
+    set_target_height(wanted_panel_height());
 }
 
 void handle_right_click(float x, float y) {
     if (g_ui.api_key_mode || g_ui.oauth_code_mode) return;
     int tab_index = tab_index_at(x, y);
     if (tab_index >= 0) {
-        g_ui.provider_menu_open = true;
-        g_ui.provider_menu_tab = tab_index;
+        if (g_ui.provider_menu_open && g_ui.provider_menu_tab == tab_index) {
+            g_ui.provider_menu_open = false;
+            g_ui.provider_menu_tab = -1;
+        } else {
+            g_ui.provider_menu_open = true;
+            g_ui.provider_menu_tab = tab_index;
+        }
     } else {
         g_ui.provider_menu_open = false;
         g_ui.provider_menu_tab = -1;
@@ -1196,8 +1232,16 @@ void handle_click(float x, float y) {
 
     int tab_index = tab_index_at(x, y);
     if (tab_index >= 0) {
-        std::lock_guard<std::mutex> lock(g_app.mutex);
-        g_app.selected = g_app.tab_providers[tab_index];
+        int chosen;
+        {
+            std::lock_guard<std::mutex> lock(g_app.mutex);
+            g_app.selected = g_app.tab_providers[tab_index];
+            chosen = g_app.selected;
+        }
+        if (provider_has_auth(chosen)) {
+            refresh_usage_async_for(chosen, false);
+        }
+        set_target_height(wanted_panel_height());
     } else if (contains(g_ui.top_refresh_button, x, y) && !busy && logged_in) {
         refresh_usage_async_for(selected, true);
     } else if (contains(g_ui.pin_button, x, y)) {
@@ -1286,8 +1330,12 @@ void load_tab_layout() {
 }
 
 void init_state() {
+    for (int i = 0; i < kTabCount; ++i) {
+        tab_rect(i) = {10.0f + i * 66.0f, 12.0f, 60.0f, 24.0f};
+    }
     load_tab_layout();
     std::lock_guard<std::mutex> lock(g_app.mutex);
+    g_app.selected = g_app.tab_providers[0];
     for (int i = 0; i < kProviderCount; ++i) {
         auto& state = g_app.providers[i];
         state.logged_in = provider_has_auth(i);
@@ -1306,6 +1354,8 @@ void init_state() {
             state.account_label = state.logged_in ? "Gemini" : "";
             state.primary = "Pro: unknown";
             state.secondary = "Flash: unknown";
+            state.primary_row = "5 hour";
+            state.secondary_row = "Weekly";
         }
     }
 }
@@ -1340,7 +1390,10 @@ bool init_fonts() {
 
 } // namespace
 
-int main(int, char**) {
+int main(int argc, char** argv) {
+    bool debug = false;
+    for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--debug") debug = true;
+    diagnostics_init(debug);
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         return 1;
     }
@@ -1382,6 +1435,8 @@ int main(int, char**) {
             else if (event.type == SDL_EVENT_MOUSE_MOTION) handle_mouse_motion();
             else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) handle_mouse_up(logical_coordinate(event.button.x), logical_coordinate(event.button.y));
             else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+                g_ui.provider_menu_open = false;
+                g_ui.provider_menu_tab = -1;
 #if defined(__linux__)
                 if (now_ms() - g_ui.shown_at_ms > 250) hide_panel();
 #else
@@ -1391,33 +1446,38 @@ int main(int, char**) {
             else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) update_render_metrics();
             else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.api_key_mode && g_ui.api_input_focused) g_ui.api_key_input += event.text.text;
             else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.oauth_code_mode && g_ui.oauth_code_input_focused) g_ui.oauth_code_input += event.text.text;
-            else if (event.type == SDL_EVENT_KEY_DOWN && (g_ui.api_key_mode || g_ui.oauth_code_mode)) {
-                bool oauth_code = g_ui.oauth_code_mode;
-                bool paste = ((event.key.mod & SDL_KMOD_CTRL) && event.key.key == SDLK_V) ||
-                    ((event.key.mod & SDL_KMOD_SHIFT) && event.key.key == SDLK_INSERT);
-                if (paste) {
-                    char* clip = SDL_GetClipboardText();
-                    if (clip) {
-                        std::string pasted = trim_copy(clip);
-                        SDL_free(clip);
-                        if (oauth_code) g_ui.oauth_code_input += compact_code(pasted);
-                        else g_ui.api_key_input += pasted;
-                        if (oauth_code) g_ui.oauth_code_input_focused = true;
-                        else g_ui.api_input_focused = true;
+            else if (event.type == SDL_EVENT_KEY_DOWN) {
+                if (event.key.key == SDLK_ESCAPE && g_ui.provider_menu_open) {
+                    g_ui.provider_menu_open = false;
+                    g_ui.provider_menu_tab = -1;
+                } else if (g_ui.api_key_mode || g_ui.oauth_code_mode) {
+                    bool oauth_code = g_ui.oauth_code_mode;
+                    bool paste = ((event.key.mod & SDL_KMOD_CTRL) && event.key.key == SDLK_V) ||
+                        ((event.key.mod & SDL_KMOD_SHIFT) && event.key.key == SDLK_INSERT);
+                    if (paste) {
+                        char* clip = SDL_GetClipboardText();
+                        if (clip) {
+                            std::string pasted = trim_copy(clip);
+                            SDL_free(clip);
+                            if (oauth_code) g_ui.oauth_code_input += compact_code(pasted);
+                            else g_ui.api_key_input += pasted;
+                            if (oauth_code) g_ui.oauth_code_input_focused = true;
+                            else g_ui.api_input_focused = true;
+                        }
+                    } else if (event.key.key == SDLK_BACKSPACE && oauth_code && !g_ui.oauth_code_input.empty() && g_ui.oauth_code_input_focused) g_ui.oauth_code_input.pop_back();
+                    else if (event.key.key == SDLK_BACKSPACE && !oauth_code && !g_ui.api_key_input.empty() && g_ui.api_input_focused) g_ui.api_key_input.pop_back();
+                    else if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
+                        if (oauth_code) save_gemini_code();
+                        else save_glm_key();
                     }
-                } else if (event.key.key == SDLK_BACKSPACE && oauth_code && !g_ui.oauth_code_input.empty() && g_ui.oauth_code_input_focused) g_ui.oauth_code_input.pop_back();
-                else if (event.key.key == SDLK_BACKSPACE && !oauth_code && !g_ui.api_key_input.empty() && g_ui.api_input_focused) g_ui.api_key_input.pop_back();
-                else if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
-                    if (oauth_code) save_gemini_code();
-                    else save_glm_key();
-                }
-                else if (event.key.key == SDLK_ESCAPE) {
-                    if (oauth_code) cancel_gemini_login();
-                    else {
-                        g_ui.api_key_mode = false;
-                        g_ui.api_input_focused = false;
-                        set_target_height(wanted_panel_height());
-                        SDL_StopTextInput(g_ui.window);
+                    else if (event.key.key == SDLK_ESCAPE) {
+                        if (oauth_code) cancel_gemini_login();
+                        else {
+                            g_ui.api_key_mode = false;
+                            g_ui.api_input_focused = false;
+                            set_target_height(wanted_panel_height());
+                            SDL_StopTextInput(g_ui.window);
+                        }
                     }
                 }
             }

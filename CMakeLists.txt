@@ -35,6 +35,7 @@ FetchContent_MakeAvailable(SDL_ttf)
 set(LLM_USAGE_TRAY_SOURCES
     src/main.cpp
     src/base64url.cpp
+    src/diagnostics.cpp
     src/json_util.cpp
     src/oauth.cpp
     src/usage.cpp
@@ -43,6 +44,7 @@ set(LLM_USAGE_TRAY_SOURCES
 if(WIN32)
     list(APPEND LLM_USAGE_TRAY_SOURCES
         src/platform/windows/credential_store.cpp
+        src/platform/windows/agy_probe.cpp
         src/platform/windows/http_client.cpp
         src/platform/windows/local_callback_server.cpp
         src/platform/windows/platform.cpp
@@ -51,6 +53,7 @@ elseif(APPLE)
     find_package(CURL REQUIRED)
     list(APPEND LLM_USAGE_TRAY_SOURCES
         src/platform/macos/credential_store.cpp
+        src/platform/unix/agy_probe.cpp
         src/platform/unix/http_client.cpp
         src/platform/unix/local_callback_server.cpp
         src/platform/unix/platform.cpp
@@ -59,6 +62,7 @@ else()
     find_package(CURL REQUIRED)
     list(APPEND LLM_USAGE_TRAY_SOURCES
         src/platform/linux/credential_store.cpp
+        src/platform/unix/agy_probe.cpp
         src/platform/unix/http_client.cpp
         src/platform/unix/local_callback_server.cpp
         src/platform/unix/platform.cpp
@@ -82,6 +86,7 @@ if(WIN32)
     target_compile_definitions(LLMUsageTray PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(LLMUsageTray PRIVATE
         winhttp
+        iphlpapi
         crypt32
         bcrypt
         advapi32

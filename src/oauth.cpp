@@ -2,16 +2,22 @@
 
 #include "base64url.h"
 #include "credential_store.h"
+#include "diagnostics.h"
 #include "http_client.h"
 #include "json_util.h"
 #include "platform.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <map>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 static constexpr const char* kClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
 static constexpr const char* kAuthorizeUrl = "https://auth.openai.com/oauth/authorize";
@@ -29,20 +35,143 @@ static constexpr const char* kGeminiAuthorizeUrl = "https://accounts.google.com/
 static constexpr const char* kGeminiTokenUrl = "https://oauth2.googleapis.com/token";
 static constexpr const char* kGeminiRedirectUri = "https://antigravity.google/oauth-callback";
 static constexpr const char* kGeminiScope = "email profile https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs https://www.googleapis.com/auth/aicode openid";
-static constexpr const char* kGeminiCodeAssistUrl = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+static constexpr const char* kGeminiCodeAssistUrls[] = {
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+};
 
 struct GeminiOAuthConfig {
     std::string client_id;
     std::string client_secret;
 };
 
+static std::optional<std::filesystem::path> find_agy_binary() {
+    std::vector<std::filesystem::path> candidates;
+    const char* path_value = std::getenv("PATH");
+    if (path_value) {
+        std::string paths = path_value;
+        std::size_t start = 0;
+        while (start <= paths.size()) {
+            std::size_t end = paths.find(
+#if defined(_WIN32)
+                ';'
+#else
+                ':'
+#endif
+                , start);
+            if (end == std::string::npos) end = paths.size();
+            if (end > start) {
+                std::filesystem::path directory = paths.substr(start, end - start);
+                candidates.push_back(directory / "agy.exe");
+                candidates.push_back(directory / "agy");
+            }
+            if (end == paths.size()) break;
+            start = end + 1;
+        }
+    }
+    const char* local_app_data = std::getenv("LOCALAPPDATA");
+    if (local_app_data) candidates.push_back(std::filesystem::path(local_app_data) / "agy" / "bin" / "agy.exe");
+    const char* user_profile = std::getenv("USERPROFILE");
+    if (user_profile) candidates.push_back(std::filesystem::path(user_profile) / ".local" / "bin" / "agy.exe");
+    const char* home = std::getenv("HOME");
+    if (home) candidates.push_back(std::filesystem::path(home) / ".local" / "bin" / "agy");
+    std::error_code error;
+    for (const auto& candidate : candidates) if (std::filesystem::is_regular_file(candidate, error)) return candidate;
+    return std::nullopt;
+}
+
+static std::string read_binary_text(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return "";
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+static bool token_character(unsigned char c) {
+    return std::isalnum(c) || c == '-' || c == '_' || c == '.';
+}
+
+static std::vector<std::pair<std::size_t, std::string>> agy_oauth_client_ids(const std::string& text) {
+    std::vector<std::pair<std::size_t, std::string>> values;
+    const std::string suffix = ".apps.googleusercontent.com";
+    std::size_t search = 0;
+    while ((search = text.find(suffix, search)) != std::string::npos) {
+        std::size_t dash_search = search;
+        while (dash_search > 0 && search - dash_search <= 256) {
+            std::size_t dash = text.rfind('-', dash_search - 1);
+            if (dash == std::string::npos || search - dash > 256) break;
+            std::size_t start = dash;
+            while (start > 0 && std::isdigit(static_cast<unsigned char>(text[start - 1]))) --start;
+            if (dash - start >= 6) {
+                std::string value = text.substr(start, search + suffix.size() - start);
+                if (std::all_of(value.begin(), value.begin() + static_cast<std::ptrdiff_t>(dash - start), [](unsigned char c) { return std::isdigit(c); }) && std::all_of(value.begin() + static_cast<std::ptrdiff_t>(dash - start), value.end(), [](unsigned char c) { return token_character(c); })) {
+                    values.emplace_back(start, std::move(value));
+                    break;
+                }
+            }
+            dash_search = dash;
+        }
+        search += suffix.size();
+    }
+    return values;
+}
+
+static std::vector<std::pair<std::size_t, std::string>> agy_oauth_client_secrets(const std::string& text) {
+    std::vector<std::pair<std::size_t, std::string>> values;
+    const std::string prefix = "GOCSPX-";
+    std::size_t search = 0;
+    while ((search = text.find(prefix, search)) != std::string::npos) {
+        std::size_t end = search + prefix.size();
+        while (end < text.size() && token_character(static_cast<unsigned char>(text[end]))) {
+            if (end > search + prefix.size() && text.compare(end, prefix.size(), prefix) == 0) break;
+            ++end;
+        }
+        values.emplace_back(search, text.substr(search, end - search));
+        search = end;
+    }
+    return values;
+}
+
+static int agy_oauth_context_score(const std::string& text, std::size_t offset) {
+    std::size_t start = offset > 4096 ? offset - 4096 : 0;
+    std::size_t length = std::min<std::size_t>(8192, text.size() - start);
+    std::string context = text.substr(start, length);
+    int score = 0;
+    for (const char* marker : {"CLOUD_CODE_URL", "CloudCodeServerURL", "cloudcode-pa.googleapis.com", "oauth", "OAuth"}) if (context.find(marker) != std::string::npos) ++score;
+    return score;
+}
+
+static std::optional<GeminiOAuthConfig> discover_agy_oauth_config() {
+    auto path = find_agy_binary();
+    if (!path) {
+        diagnostics_log("gemini oauth config source=none agy_not_found");
+        return std::nullopt;
+    }
+    std::string text = read_binary_text(*path);
+    if (text.empty()) {
+        diagnostics_log("gemini oauth config source=none agy_binary_unreadable");
+        return std::nullopt;
+    }
+    auto ids = agy_oauth_client_ids(text);
+    auto secrets = agy_oauth_client_secrets(text);
+    if (ids.empty() || secrets.empty()) {
+        diagnostics_log("gemini oauth config source=none agy_values_not_found");
+        return std::nullopt;
+    }
+    auto best_id = std::max_element(ids.begin(), ids.end(), [&](const auto& left, const auto& right) { return agy_oauth_context_score(text, left.first) < agy_oauth_context_score(text, right.first); });
+    auto best_secret = std::max_element(secrets.begin(), secrets.end(), [&](const auto& left, const auto& right) { return agy_oauth_context_score(text, left.first) < agy_oauth_context_score(text, right.first); });
+    diagnostics_log("gemini oauth config source=agy path=" + path->string() + " client_candidates=" + std::to_string(ids.size()) + " secret_candidates=" + std::to_string(secrets.size()) + " selected_secret_length=" + std::to_string(best_secret->second.size()));
+    return GeminiOAuthConfig{best_id->second, best_secret->second};
+}
+
 static GeminiOAuthConfig gemini_oauth_config() {
     const char* client_id = std::getenv("LLM_USAGE_TRAY_GEMINI_CLIENT_ID");
     const char* client_secret = std::getenv("LLM_USAGE_TRAY_GEMINI_CLIENT_SECRET");
-    if (!client_id || !*client_id || !client_secret || !*client_secret) {
-        throw std::runtime_error("Set LLM_USAGE_TRAY_GEMINI_CLIENT_ID and LLM_USAGE_TRAY_GEMINI_CLIENT_SECRET before Gemini login");
-    }
-    return {client_id, client_secret};
+    std::optional<GeminiOAuthConfig> discovered = (client_id && *client_id && client_secret && *client_secret) ? std::nullopt : discover_agy_oauth_config();
+    std::string resolved_id = client_id && *client_id ? client_id : (discovered ? discovered->client_id : "");
+    std::string resolved_secret = client_secret && *client_secret ? client_secret : (discovered ? discovered->client_secret : "");
+    if (resolved_id.empty() || resolved_secret.empty()) throw std::runtime_error("Install AGY or set LLM_USAGE_TRAY_GEMINI_CLIENT_ID and LLM_USAGE_TRAY_GEMINI_CLIENT_SECRET before Gemini login");
+    diagnostics_log("gemini oauth config resolved client_id_length=" + std::to_string(resolved_id.size()) + " client_secret_length=" + std::to_string(resolved_secret.size()) + " env_override=" + std::string(client_id && *client_id && client_secret && *client_secret ? "true" : "false"));
+    return {resolved_id, resolved_secret};
 }
 
 static long long now_ms() {
@@ -178,6 +307,7 @@ static OAuthCredentials exchange_gemini_code(const std::string& code, const std:
         {"code_verifier", verifier},
         {"redirect_uri", kGeminiRedirectUri},
     });
+    diagnostics_log("gemini token exchange status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()) + " error=" + json_string(res.body, "error").value_or("none"));
     if (res.status < 200 || res.status >= 300) {
         throw std::runtime_error("Gemini token exchange failed: HTTP " + std::to_string(res.status));
     }
@@ -195,17 +325,30 @@ static OAuthCredentials exchange_gemini_code(const std::string& code, const std:
 }
 
 std::string gemini_discover_project(const std::string& access_token) {
-    std::string body = "{\"metadata\":{\"ideType\":\"ANTIGRAVITY\"}}";
-    HttpResponse res = http_post_json(kGeminiCodeAssistUrl, body, {
-        {"Authorization", "Bearer " + access_token},
-        {"User-Agent", "antigravity/1.1.24"},
-    });
-    if (res.status < 200 || res.status >= 300) {
-        throw std::runtime_error("Gemini project discovery failed: HTTP " + std::to_string(res.status));
+    const std::string bodies[] = {
+        "{\"metadata\":{\"ideType\":\"ANTIGRAVITY\"}}",
+        "{\"metadata\":{\"ideType\":\"IDE_UNSPECIFIED\",\"platform\":\"PLATFORM_UNSPECIFIED\",\"pluginType\":\"GEMINI\"}}",
+    };
+    int last_status = 0;
+    for (const char* url : kGeminiCodeAssistUrls) {
+        for (std::size_t body_index = 0; body_index < sizeof(bodies) / sizeof(bodies[0]); ++body_index) {
+            const std::string& body = bodies[body_index];
+            HttpResponse res = http_post_json(url, body, {
+                {"Authorization", "Bearer " + access_token},
+                {"User-Agent", "antigravity/cli/1.1.24 windows/amd64"},
+            });
+            last_status = res.status;
+            diagnostics_log("gemini project discovery url=" + std::string(url) + " variant=" + std::to_string(body_index + 1) + " status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()));
+            if (res.status < 200 || res.status >= 300) continue;
+            std::string project = json_string(res.body, "cloudaicompanionProject").value_or("");
+            if (!project.empty()) {
+                diagnostics_log("gemini project discovery result=present project_length=" + std::to_string(project.size()));
+                return project;
+            }
+        }
     }
-    std::string project = json_string(res.body, "cloudaicompanionProject").value_or("");
-    if (project.empty()) throw std::runtime_error("Gemini project discovery returned no project");
-    return project;
+    if (last_status) throw std::runtime_error("Gemini project discovery failed: HTTP " + std::to_string(last_status));
+    throw std::runtime_error("Gemini project discovery failed");
 }
 
 OAuthCredentials oauth_login_browser() {
@@ -249,6 +392,7 @@ OAuthLoginSession oauth_begin_manual_login_provider(const std::string& provider)
     session.client_id = config.client_id;
     session.client_secret = config.client_secret;
     session.authorize_url = create_gemini_authorize_url(config.client_id, base64url_encode(sha256_bytes(session.verifier)), session.state);
+    diagnostics_log("gemini oauth browser start");
     open_browser(session.authorize_url);
     return session;
 }
@@ -257,7 +401,9 @@ OAuthCredentials oauth_finish_manual_login_provider(const OAuthLoginSession& ses
     if (session.provider != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini");
     if (session.client_id.empty() || session.client_secret.empty()) throw std::runtime_error("Gemini OAuth session is missing client configuration");
     GeminiOAuthConfig config{session.client_id, session.client_secret};
+    diagnostics_log("gemini oauth code submit length=" + std::to_string(code.size()));
     OAuthCredentials credentials = exchange_gemini_code(code, session.verifier, config);
+    save_credentials_provider(session.provider, credentials);
     credentials.account_id = gemini_discover_project(credentials.access);
     save_credentials_provider(session.provider, credentials);
     return credentials;
