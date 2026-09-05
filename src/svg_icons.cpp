@@ -20,10 +20,20 @@
 #endif
 #endif
 
-static SDL_Texture* g_provider[5]{};
-static SDL_Texture* g_gear = nullptr;
-static SDL_Texture* g_pin = nullptr;
+struct IconSet {
+    SDL_Renderer* renderer = nullptr;
+    SDL_Texture* provider[5]{};
+    SDL_Texture* gear = nullptr;
+    SDL_Texture* pin = nullptr;
+};
+
+static std::vector<IconSet> g_sets;
 static SDL_Renderer* g_renderer = nullptr;
+
+static IconSet* current_set() {
+    for (auto& set : g_sets) if (set.renderer == g_renderer) return &set;
+    return nullptr;
+}
 
 static std::string read_file(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
@@ -80,7 +90,7 @@ static void paint_white(std::string& svg) {
     replace("fill='#000000'", "fill='#FFFFFF'");
 }
 
-static SDL_Texture* rasterize(const std::string& raw, bool white, int size) {
+static SDL_Texture* rasterize(SDL_Renderer* renderer, const std::string& raw, bool white, int size) {
     if (raw.empty()) return nullptr;
     std::string svg = raw;
     if (white) paint_white(svg);
@@ -102,7 +112,7 @@ static SDL_Texture* rasterize(const std::string& raw, bool white, int size) {
     nsvgDelete(image);
     SDL_Surface* surface = SDL_CreateSurfaceFrom(size, size, SDL_PIXELFORMAT_RGBA32, pixels.data(), size * 4);
     if (!surface) return nullptr;
-    SDL_Texture* texture = SDL_CreateTextureFromSurface(g_renderer, surface);
+    SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
     SDL_DestroySurface(surface);
     if (texture) {
         SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
@@ -112,37 +122,67 @@ static SDL_Texture* rasterize(const std::string& raw, bool white, int size) {
 }
 
 void icons_load(SDL_Renderer* renderer) {
-    icons_unload();
+    if (!renderer) return;
+    for (auto& set : g_sets) {
+        if (set.renderer == renderer) {
+            g_renderer = renderer;
+            return;
+        }
+    }
+    IconSet set;
+    set.renderer = renderer;
     g_renderer = renderer;
     int size = 64;
-    g_provider[0] = rasterize(find_svg("codex.svg"), true, size);
-    g_provider[1] = rasterize(find_svg("claude-color.svg"), false, size);
-    g_provider[2] = rasterize(find_svg("zai.svg"), true, size);
-    g_provider[3] = rasterize(find_svg("gemini-color.svg"), false, size);
-    g_provider[4] = rasterize(find_svg("grok.svg"), true, size);
-    g_gear = rasterize(find_svg("settings.svg"), true, size);
-    g_pin = rasterize(find_svg("pin.svg"), true, size);
+    set.provider[0] = rasterize(renderer, find_svg("codex.svg"), true, size);
+    set.provider[1] = rasterize(renderer, find_svg("claude-color.svg"), false, size);
+    set.provider[2] = rasterize(renderer, find_svg("zai.svg"), true, size);
+    set.provider[3] = rasterize(renderer, find_svg("gemini-color.svg"), false, size);
+    set.provider[4] = rasterize(renderer, find_svg("grok.svg"), true, size);
+    set.gear = rasterize(renderer, find_svg("settings.svg"), true, size);
+    set.pin = rasterize(renderer, find_svg("pin.svg"), true, size);
+    g_sets.push_back(set);
+}
+
+void icons_set_renderer(SDL_Renderer* renderer) {
+    g_renderer = renderer;
+}
+
+void icons_unload_renderer(SDL_Renderer* renderer) {
+    for (auto it = g_sets.begin(); it != g_sets.end(); ++it) {
+        if (it->renderer != renderer) continue;
+        for (auto& texture : it->provider) {
+            if (texture) SDL_DestroyTexture(texture);
+            texture = nullptr;
+        }
+        if (it->gear) SDL_DestroyTexture(it->gear);
+        if (it->pin) SDL_DestroyTexture(it->pin);
+        g_sets.erase(it);
+        break;
+    }
+    if (g_renderer == renderer) g_renderer = nullptr;
 }
 
 void icons_unload() {
-    for (int i = 0; i < 5; ++i) {
-        if (g_provider[i]) SDL_DestroyTexture(g_provider[i]);
-        g_provider[i] = nullptr;
+    for (auto& set : g_sets) {
+        for (auto& texture : set.provider) {
+            if (texture) SDL_DestroyTexture(texture);
+            texture = nullptr;
+        }
+        if (set.gear) SDL_DestroyTexture(set.gear);
+        if (set.pin) SDL_DestroyTexture(set.pin);
     }
-    if (g_gear) SDL_DestroyTexture(g_gear);
-    if (g_pin) SDL_DestroyTexture(g_pin);
-    g_gear = nullptr;
-    g_pin = nullptr;
+    g_sets.clear();
     g_renderer = nullptr;
 }
 
 SDL_Texture* icon_provider(int index) {
     if (index < 0 || index > 4) return nullptr;
-    return g_provider[index];
+    IconSet* set = current_set();
+    return set ? set->provider[index] : nullptr;
 }
 
-SDL_Texture* icon_gear() { return g_gear; }
-SDL_Texture* icon_pin() { return g_pin; }
+SDL_Texture* icon_gear() { IconSet* set = current_set(); return set ? set->gear : nullptr; }
+SDL_Texture* icon_pin() { IconSet* set = current_set(); return set ? set->pin : nullptr; }
 
 void icons_draw(SDL_Texture* texture, float cx, float cy, float size) {
     if (!texture || !g_renderer) return;
