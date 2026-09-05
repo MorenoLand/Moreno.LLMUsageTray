@@ -64,6 +64,7 @@ constexpr int kRingSize = 52;
 constexpr int kRingSlot = 78;
 constexpr int kDockFooter = 44;
 constexpr int kCalloutHeight = 168;
+constexpr int kCalloutSingleRowHeight = 112;
 constexpr int kSettingsRowHeight = 52;
 constexpr int kSettingsHeader = 48;
 constexpr int kSettingsExtra = 112;
@@ -89,7 +90,7 @@ struct ProviderState {
     std::string status = "Not logged in";
     std::string account;
     std::string account_label;
-    std::string primary_row = "Current session";
+    std::string primary_row = "5 hour";
     std::string secondary_row = "All models";
     std::string tertiary_row = "Requests";
     bool primary_available = true;
@@ -125,6 +126,8 @@ struct UiState {
     float card_local_x[kProviderCount]{};
     int card_window_x[kProviderCount]{};
     int card_window_y[kProviderCount]{};
+    int card_window_width[kProviderCount]{};
+    int card_window_height[kProviderCount]{};
     Rect card_pin_button[kProviderCount];
     SDL_Tray* tray = nullptr;
     SDL_Surface* icon = nullptr;
@@ -368,11 +371,22 @@ const char* provider_label(int index) {
     return kind == 1 ? "Claude" : "GPT";
 }
 
+bool gpt_weekly_window(const RateWindow& window) {
+    if (window.limit_window_seconds > 0) return window.limit_window_seconds >= 24 * 60 * 60;
+    return window.reset_at > now_ms() / 1000 + 24 * 60 * 60;
+}
+
+const char* gpt_row_label(const RateWindow& window, const char* fallback) {
+    if (!window.available) return fallback;
+    return gpt_weekly_window(window) ? "Weekly" : "5 hour";
+}
+
 const char* primary_row_label(int index) {
     int kind = kind_of(index);
     if (kind == 4) return "Grok CLI";
     if (kind == 2) return "5 hour";
     if (kind == 3) return "5 hour";
+    if (kind == 0) return "5 hour";
     return "Current session";
 }
 
@@ -480,6 +494,16 @@ double display_percent(double used) {
     return std::clamp(value, 0.0, 100.0);
 }
 
+int callout_height_for(const ProviderState& state) {
+    return state.primary_available && state.secondary_available ? kCalloutHeight : kCalloutSingleRowHeight;
+}
+
+int callout_height_for(int index) {
+    if (index < 0 || index >= kProviderCount) return kCalloutHeight;
+    std::lock_guard<std::mutex> lock(g_app.mutex);
+    return callout_height_for(g_app.providers[index]);
+}
+
 float ring_cy_for(int index) {
     int vis[kProviderCount];
     int n = collect_visible(vis);
@@ -490,7 +514,7 @@ float ring_cy_for(int index) {
 }
 
 float snap_off_y(int index) {
-    float h = static_cast<float>(kCalloutHeight);
+    float h = static_cast<float>(callout_height_for(index));
     float y = ring_cy_for(index) - g_ui.dock_oy - h * 0.5f;
     float maxy = std::max(0.0f, static_cast<float>(dock_height()) - h);
     return std::clamp(y, 0.0f, maxy);
@@ -516,7 +540,7 @@ float callout_y_for(int index) {
 
 void left_card_geom(float* y, float* h) {
     bool sheet = left_sheet_open();
-    *h = sheet ? static_cast<float>(settings_height()) : static_cast<float>(kCalloutHeight);
+    *h = sheet ? static_cast<float>(settings_height()) : static_cast<float>(callout_height_for(selected_provider()));
     if (sheet) {
         *y = 0;
         return;
@@ -1025,6 +1049,22 @@ void update_hover(float x, float y) {
     for (int i = 0; i < kProviderCount; ++i) if (contains(g_ui.ring_slots[i], x, y)) g_ui.hover_ring = i;
 }
 
+bool global_point_in_window(SDL_Window* window, float x, float y) {
+    if (!window) return false;
+    int wx = 0, wy = 0, ww = 0, wh = 0;
+    SDL_GetWindowPosition(window, &wx, &wy);
+    SDL_GetWindowSize(window, &ww, &wh);
+    return x >= static_cast<float>(wx) && x < static_cast<float>(wx + ww) && y >= static_cast<float>(wy) && y < static_cast<float>(wy + wh);
+}
+
+bool global_point_over_owned_window(float x, float y) {
+    if (global_point_in_window(g_ui.window, x, y)) return true;
+    for (int i = 0; i < kProviderCount; ++i) {
+        if (g_ui.card_window_visible[i] && global_point_in_window(g_ui.card_window[i], x, y)) return true;
+    }
+    return false;
+}
+
 void poll_dismiss() {
     float gx = 0, gy = 0;
     bool down = (SDL_GetGlobalMouseState(&gx, &gy) & SDL_BUTTON_LMASK) != 0;
@@ -1033,11 +1073,7 @@ void poll_dismiss() {
     if (!g_ui.visible || g_ui.dragging || g_ui.dragging_model >= 0 || g_ui.reorder_slot >= 0 || g_ui.click_armed) return;
     if (now_ms() - g_ui.shown_at_ms < 800) return;
     if (!pressed) return;
-    if (SDL_GetMouseFocus() == g_ui.window) return;
-    int wx = 0, wy = 0, ww = 0, wh = 0;
-    SDL_GetWindowPosition(g_ui.window, &wx, &wy);
-    SDL_GetWindowSize(g_ui.window, &ww, &wh);
-    if (gx >= static_cast<float>(wx) && gx < static_cast<float>(wx + ww) && gy >= static_cast<float>(wy) && gy < static_cast<float>(wy + wh)) return;
+    if (global_point_over_owned_window(gx, gy)) return;
     hide_panel();
 }
 
@@ -1080,6 +1116,10 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             }
             state.primary_row = primary_row_label(provider_index);
             state.secondary_row = secondary_row_label(provider_index);
+            if (kind == 0) {
+                state.primary_row = gpt_row_label(info.primary, "5 hour");
+                state.secondary_row = gpt_row_label(info.secondary, "Weekly");
+            }
             state.tertiary_row = "Requests";
             state.primary_available = info.primary.available;
             state.secondary_available = info.secondary.available;
@@ -1686,7 +1726,7 @@ void draw_input_field(Rect box, const std::string& masked, bool focused) {
 }
 
 void draw_model_card_content(int index, float card_x, float card_y, const ProviderState& state, int selected, Uint8 alpha, bool tail, std::optional<bool> tail_right = std::nullopt) {
-    float card_h = static_cast<float>(kCalloutHeight);
+    float card_h = static_cast<float>(callout_height_for(state));
     draw_left_card_chrome(card_x, card_y, card_h, alpha, tail, tail_right);
     g_ui.model_callout_rect[index] = g_ui.callout_rect;
     draw_provider_glyph(card_x + 28, card_y + 26, index, provider_accent(index));
@@ -1904,7 +1944,9 @@ bool create_card_window(int index) {
     if (index < 0 || index >= kProviderCount) return false;
     if (g_ui.card_window[index] && g_ui.card_renderer[index]) return true;
     int logical_width = kCalloutWidth + kTailWidth;
-    int logical_height = kCalloutHeight + 8;
+    int logical_height = callout_height_for(index) + 8;
+    int width = static_cast<int>(std::round(logical_width * g_ui.panel_scale));
+    int height = static_cast<int>(std::round(logical_height * g_ui.panel_scale));
     SDL_Window* window = SDL_CreateWindow("LLM Usage Tray Card", logical_width, logical_height,
         SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_TRANSPARENT | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) return false;
@@ -1916,8 +1958,10 @@ bool create_card_window(int index) {
     g_ui.card_window[index] = window;
     g_ui.card_renderer[index] = renderer;
     g_ui.card_window_id[index] = SDL_GetWindowID(window);
+    g_ui.card_window_width[index] = width;
+    g_ui.card_window_height[index] = height;
     SDL_SetWindowFocusable(window, false);
-    SDL_SetWindowSize(window, static_cast<int>(std::round(logical_width * g_ui.panel_scale)), static_cast<int>(std::round(logical_height * g_ui.panel_scale)));
+    SDL_SetWindowSize(window, width, height);
     SDL_SyncWindow(window);
     SDL_SetRenderLogicalPresentation(renderer, logical_width, logical_height, SDL_LOGICAL_PRESENTATION_STRETCH);
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
@@ -1937,6 +1981,8 @@ void destroy_card_windows() {
         g_ui.card_window[i] = nullptr;
         g_ui.card_window_id[i] = 0;
         g_ui.card_window_visible[i] = false;
+        g_ui.card_window_width[i] = 0;
+        g_ui.card_window_height[i] = 0;
     }
 }
 
@@ -1964,12 +2010,24 @@ void sync_card_windows() {
         int x = 0, y = 0;
         bool tail_right = true;
         card_window_position(i, &x, &y, &tail_right);
-        if (!g_ui.card_window_visible[i] || g_ui.card_window_x[i] != x || g_ui.card_window_y[i] != y) {
+        int logical_width = kCalloutWidth + kTailWidth;
+        int logical_height = callout_height_for(i) + 8;
+        int width = static_cast<int>(std::round(logical_width * g_ui.panel_scale));
+        int height = static_cast<int>(std::round(logical_height * g_ui.panel_scale));
+        bool resized = g_ui.card_window_width[i] != width || g_ui.card_window_height[i] != height;
+        bool moved = !g_ui.card_window_visible[i] || g_ui.card_window_x[i] != x || g_ui.card_window_y[i] != y;
+        if (resized) {
+            SDL_SetWindowSize(g_ui.card_window[i], width, height);
+            SDL_SetRenderLogicalPresentation(g_ui.card_renderer[i], logical_width, logical_height, SDL_LOGICAL_PRESENTATION_STRETCH);
+            g_ui.card_window_width[i] = width;
+            g_ui.card_window_height[i] = height;
+        }
+        if (moved) {
             SDL_SetWindowPosition(g_ui.card_window[i], x, y);
-            SDL_SyncWindow(g_ui.card_window[i]);
             g_ui.card_window_x[i] = x;
             g_ui.card_window_y[i] = y;
         }
+        if (resized || moved) SDL_SyncWindow(g_ui.card_window[i]);
         if (!g_ui.card_window_visible[i]) {
             SDL_ShowWindow(g_ui.card_window[i]);
             g_ui.card_window_visible[i] = true;
@@ -2003,7 +2061,7 @@ void draw_card_window(int index) {
     int rw = 0, rh = 0;
     SDL_GetRenderOutputSize(g_ui.renderer, &rw, &rh);
     float logical_width = static_cast<float>(kCalloutWidth + kTailWidth);
-    float logical_height = static_cast<float>(kCalloutHeight + 8);
+    float logical_height = static_cast<float>(callout_height_for(state) + 8);
     g_ui.render_scale = std::max(1.0f, std::max(rw / logical_width, rh / logical_height));
     set_color(0, 0, 0, 0);
     SDL_RenderClear(g_ui.renderer);
