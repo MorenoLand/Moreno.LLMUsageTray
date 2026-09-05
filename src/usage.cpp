@@ -231,19 +231,34 @@ static std::string object_for_type(const std::string& body, const std::string& t
     return body.substr(start, end - start + 1);
 }
 
+static double glm_percent(const std::string& obj) {
+    if (auto value = json_number(obj, "percentage")) return *value;
+    std::string text = json_string(obj, "percentage").value_or("");
+    if (!text.empty()) {
+        char* end = nullptr;
+        double parsed = std::strtod(text.c_str(), &end);
+        if (end != text.c_str()) return parsed;
+    }
+    double usage = json_number(obj, "usage").value_or(-1);
+    double remaining = json_number(obj, "remaining").value_or(-1);
+    double current = json_number(obj, "currentValue").value_or(-1);
+    if (usage >= 0 && remaining >= 0 && usage + remaining > 0) return usage / (usage + remaining) * 100.0;
+    if (usage >= 0 && current > 0) return usage / current * 100.0;
+    return 0;
+}
+
 static RateWindow parse_glm_window(const std::string& body, const std::string& type, int unit = 0) {
-    std::size_t pos = 0;
-    while ((pos = body.find("\"type\":\"" + type + "\"", pos)) != std::string::npos) {
-        std::size_t start = body.rfind('{', pos);
-        std::size_t end = body.find('}', pos);
-        if (start == std::string::npos || end == std::string::npos) break;
-        std::string obj = body.substr(start, end - start + 1);
-        pos = end + 1;
+    std::string data = object_for_key(body, "data");
+    std::string limits = array_for_key(data.empty() ? body : data, "limits");
+    if (limits.empty()) limits = array_for_key(body, "limits");
+    for (const std::string& obj : objects_in_array(limits)) {
+        if (json_string(obj, "type").value_or("") != type) continue;
         if (unit && static_cast<int>(json_number(obj, "unit").value_or(0)) != unit) continue;
         RateWindow window;
         window.available = true;
-        window.used_percent = json_number(obj, "percentage").value_or(0);
+        window.used_percent = std::clamp(glm_percent(obj), 0.0, 100.0);
         long long reset_ms = static_cast<long long>(json_number(obj, "nextResetTime").value_or(0));
+        if (reset_ms <= 0) reset_ms = parse_iso_or_epoch_reset(json_string(obj, "nextResetTime").value_or(""));
         window.reset_at = reset_ms > 100000000000LL ? reset_ms / 1000 : reset_ms;
         return window;
     }

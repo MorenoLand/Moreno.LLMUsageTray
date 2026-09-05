@@ -446,10 +446,19 @@ OAuthCredentials oauth_login_browser_provider(const std::string& provider) {
 }
 
 OAuthLoginSession oauth_begin_manual_login_provider(const std::string& provider) {
-    if (provider != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini");
-    GeminiOAuthConfig config = gemini_oauth_config();
     OAuthLoginSession session;
     session.provider = provider;
+    if (provider == "grok") {
+        session.verifier = base64url_encode(random_bytes(96));
+        session.state = base64url_encode(random_bytes(16));
+        session.client_id = kGrokClientId;
+        session.authorize_url = create_grok_authorize_url(base64url_encode(sha256_bytes(session.verifier)), session.state);
+        diagnostics_log("grok oauth browser start");
+        open_browser(session.authorize_url);
+        return session;
+    }
+    if (provider != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini and Grok");
+    GeminiOAuthConfig config = gemini_oauth_config();
     session.verifier = base64url_encode(random_bytes(32));
     session.state = base64url_encode(random_bytes(16));
     session.client_id = config.client_id;
@@ -461,7 +470,13 @@ OAuthLoginSession oauth_begin_manual_login_provider(const std::string& provider)
 }
 
 OAuthCredentials oauth_finish_manual_login_provider(const OAuthLoginSession& session, const std::string& code) {
-    if (session.provider != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini");
+    if (session.provider == "grok") {
+        diagnostics_log("grok oauth code submit length=" + std::to_string(code.size()));
+        OAuthCredentials credentials = exchange_grok_code(code, session.verifier);
+        save_credentials_provider(session.provider, credentials);
+        return credentials;
+    }
+    if (session.provider != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini and Grok");
     if (session.client_id.empty() || session.client_secret.empty()) throw std::runtime_error("Gemini OAuth session is missing client configuration");
     GeminiOAuthConfig config{session.client_id, session.client_secret};
     diagnostics_log("gemini oauth code submit length=" + std::to_string(code.size()));
