@@ -460,6 +460,12 @@ float callout_y_for(int index) {
     return snap_callout_y(index);
 }
 
+bool callout_outside_layout(int index) {
+    float x = callout_x_for(index);
+    float y = callout_y_for(index);
+    return x < -2.0f || y < -2.0f || x + static_cast<float>(kCalloutWidth) > static_cast<float>(layout_width()) + 2.0f || y + static_cast<float>(kCalloutHeight + 8) > static_cast<float>(g_ui.panel_height) + 2.0f;
+}
+
 void left_card_geom(float* y, float* h) {
     bool sheet = left_sheet_open();
     *h = sheet ? static_cast<float>(settings_height()) : static_cast<float>(kCalloutHeight);
@@ -617,25 +623,37 @@ void update_window_shape() {
     if (!shape) return;
     SDL_ClearSurface(shape, 0, 0, 0, 0);
     Uint32 on = SDL_MapSurfaceRGBA(shape, 255, 255, 255, 255);
-    float sx = static_cast<float>(pw) / static_cast<float>(std::max(1, kPanelWidth));
+    float sx = static_cast<float>(pw) / static_cast<float>(std::max(1, layout_width()));
     float sy = static_cast<float>(ph) / static_cast<float>(std::max(1, g_ui.panel_height));
     auto SX = [&](float v) { return static_cast<int>(std::lround(v * sx)); };
     auto SY = [&](float v) { return static_cast<int>(std::lround(v * sy)); };
-    int dock_h = std::max(dock_height(), g_ui.callout_open && !left_sheet_open() ? kCalloutHeight : 0);
-    SDL_Rect dock{SX(dock_x()), 0, SX(static_cast<float>(kDockWidth)), SY(static_cast<float>(dock_h))};
-    fill_surface_round_rect(shape, dock, std::max(1, SX(static_cast<float>(kDockRadius))), on);
-    if (g_ui.callout_open || left_sheet_open()) {
-        float card_y = 0, card_h = 0;
-        left_card_geom(&card_y, &card_h);
-        SDL_Rect callout{0, SY(card_y), SX(static_cast<float>(kCalloutWidth)), SY(card_h)};
-        fill_surface_round_rect(shape, callout, std::max(1, SX(static_cast<float>(kCardRadius))), on);
-        int mid = SY(card_y + card_h * 0.5f);
-        int tail_x = SX(static_cast<float>(kCalloutWidth)) - 1;
+    auto add_card = [&](float x, float y, float h, bool tail) {
+        SDL_Rect card{SX(x), SY(y), std::max(1, SX(static_cast<float>(kCalloutWidth))), std::max(1, SY(h))};
+        fill_surface_round_rect(shape, card, std::max(1, SX(static_cast<float>(kCardRadius))), on);
+        if (!tail) return;
+        float cy = y + h * 0.5f;
+        bool tail_right = g_ui.dock_ox + static_cast<float>(kDockWidth) * 0.5f >= x + static_cast<float>(kCalloutWidth) * 0.5f;
         int tail_w = std::max(1, SX(static_cast<float>(kTailWidth + kCardGap)));
-        for (int x = 0; x < tail_w; ++x) {
-            int spread = std::max(1, SY(7.0f) - x * SY(7.0f) / tail_w);
-            SDL_Rect sliver{tail_x + x, mid - spread, 1, spread * 2};
+        int mid = SY(cy);
+        for (int i = 0; i < tail_w; ++i) {
+            int spread = std::max(1, SY(7.0f) - i * SY(7.0f) / tail_w);
+            int tx = tail_right ? SX(x + static_cast<float>(kCalloutWidth)) - 1 + i : SX(x) - i - 1;
+            SDL_Rect sliver{tx, mid - spread, 1, spread * 2};
             fill_surface_rect(shape, sliver, on);
+        }
+    };
+    int dock_h = std::max(dock_height(), g_ui.callout_open && !left_sheet_open() ? kCalloutHeight : 0);
+    SDL_Rect dock{SX(dock_x()), SY(g_ui.dock_oy), std::max(1, SX(static_cast<float>(kDockWidth))), std::max(1, SY(static_cast<float>(dock_h)))};
+    fill_surface_round_rect(shape, dock, std::max(1, SX(static_cast<float>(kDockRadius))), on);
+    if (left_sheet_open()) {
+        float card_y = g_ui.dock_oy, card_h = static_cast<float>(settings_height());
+        add_card(snap_callout_x(), card_y, card_h, true);
+    } else {
+        int selected = selected_provider();
+        for (int i = 0; i < kProviderCount; ++i) {
+            if (!g_ui.model_open[i] && g_ui.model_anim[i] < 0.02f) continue;
+            float card_y = model_is_snapped(i) && i == selected ? g_ui.card_y_anim : callout_y_for(i);
+            add_card(callout_x_for(i), card_y, static_cast<float>(kCalloutHeight), !callout_floating(i));
         }
     }
     SDL_SetWindowShape(g_ui.window, shape);
@@ -2138,6 +2156,7 @@ void handle_mouse_motion() {
         float dx = g_ui.model_off_x[index] - snap_off_x();
         float dy = g_ui.model_off_y[index] - snap_off_y(index);
         if (dx * dx + dy * dy > 400.0f) g_ui.model_detached[index] = true;
+        if (callout_outside_layout(index)) apply_layout();
         return;
     }
     if (!g_ui.dragging) return;
