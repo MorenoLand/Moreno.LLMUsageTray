@@ -66,8 +66,9 @@ constexpr int kDockFooter = 44;
 constexpr int kCalloutHeight = 168;
 constexpr int kSettingsRowHeight = 52;
 constexpr int kSettingsHeader = 48;
-constexpr int kSettingsExtra = 44;
+constexpr int kSettingsExtra = 112;
 constexpr int kSettingsFooter = 56;
+constexpr int kDefaultRefreshIntervalSeconds = 300;
 constexpr int kKindCount = 5;
 constexpr int kMaxSlots = 10;
 constexpr int kProviderCount = kMaxSlots;
@@ -169,6 +170,7 @@ struct UiState {
     float model_anim[kProviderCount]{};
     float slot_anim[kProviderCount]{};
     bool show_remaining = false;
+    int refresh_interval_seconds = kDefaultRefreshIntervalSeconds;
     int oauth_slot = 3;
     int api_key_slot = 2;
     int dragging_model = -1;
@@ -189,6 +191,7 @@ struct UiState {
     Rect settings_remove[kProviderCount];
     Rect settings_add_kind[kKindCount];
     Rect settings_quit, settings_refresh, settings_fill_toggle;
+    Rect settings_refresh_interval;
     bool confirm_open = false;
     int confirm_index = -1;
     Rect confirm_cancel, confirm_delete;
@@ -438,6 +441,22 @@ void request_settings(bool open) {
     if (open) g_ui.settings_open = true;
 }
 
+bool valid_refresh_interval(int seconds) {
+    return seconds == 30 || seconds == 45 || seconds == 60 || seconds == 300 || seconds == 900 || seconds == 1800 || seconds == 3600;
+}
+
+int next_refresh_interval(int current) {
+    constexpr int options[] = {30, 45, 60, 300, 900, 1800, 3600};
+    constexpr int count = static_cast<int>(sizeof(options) / sizeof(options[0]));
+    for (int i = 0; i < count; ++i) if (options[i] == current) return options[(i + 1) % count];
+    return kDefaultRefreshIntervalSeconds;
+}
+
+std::string refresh_interval_label(int seconds) {
+    if (seconds < 60) return std::to_string(seconds) + " sec";
+    return std::to_string(seconds / 60) + " min";
+}
+
 void sync_callout_open() {
     g_ui.callout_open = false;
     for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_open[i]) g_ui.callout_open = true;
@@ -578,7 +597,7 @@ bool over_click_target(float x, float y) {
         for (int i = 0; i < kProviderCount; ++i) {
             if (contains(g_ui.settings_toggle[i], x, y) || contains(g_ui.settings_action[i], x, y)) return true;
         }
-        return contains(g_ui.settings_quit, x, y) || contains(g_ui.settings_refresh, x, y) || contains(g_ui.settings_fill_toggle, x, y) || contains(g_ui.callout_rect, x, y);
+        return contains(g_ui.settings_quit, x, y) || contains(g_ui.settings_refresh, x, y) || contains(g_ui.settings_fill_toggle, x, y) || contains(g_ui.settings_refresh_interval, x, y) || contains(g_ui.callout_rect, x, y);
     }
     return false;
 }
@@ -895,7 +914,7 @@ void show_panel() {
 
 void hide_panel() {
     if (g_ui.api_key_mode || g_ui.oauth_code_mode) return;
-    if (g_ui.pinned || any_model_pinned_open()) {
+    if (g_ui.pinned) {
         request_settings(false);
         for (int i = 0; i < kProviderCount; ++i) {
             if (g_ui.model_open[i] && !g_ui.model_pinned[i]) {
@@ -910,7 +929,7 @@ void hide_panel() {
     g_ui.visible = false;
     g_ui.callout_open = false;
     request_settings(false);
-    for (int i = 0; i < kProviderCount; ++i) {
+    for (int i = 0; i < kProviderCount; ++i) if (!g_ui.model_pinned[i]) {
         g_ui.model_open[i] = false;
         g_ui.model_detached[i] = false;
     }
@@ -957,7 +976,7 @@ void tick_ui(float dt) {
         g_ui.slot_anim[i] = approach(g_ui.slot_anim[i], shown[i] ? 1.0f : 0.0f, dt, 14.0f);
     }
     g_ui.gear_hot = approach(g_ui.gear_hot, g_ui.gear_hovered ? 1.0f : 0.0f, dt, 16.0f);
-    g_ui.pin_hot = approach(g_ui.pin_hot, (g_ui.pin_hovered || g_ui.pinned || any_model_pinned_open()) ? 1.0f : 0.0f, dt, 16.0f);
+    g_ui.pin_hot = approach(g_ui.pin_hot, (g_ui.pin_hovered || g_ui.pinned) ? 1.0f : 0.0f, dt, 16.0f);
     bool relayout = false;
     for (int i = 0; i < kProviderCount; ++i) {
         float prev = g_ui.model_anim[i];
@@ -1024,7 +1043,7 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         auto& state = g_app.providers[provider_index];
         if (state.busy) return;
-        if (!force && state.last_refresh_ms > 0 && now_ms() - state.last_refresh_ms < 5 * 60 * 1000) return;
+        if (!force && state.last_refresh_ms > 0 && now_ms() - state.last_refresh_ms < static_cast<long long>(g_ui.refresh_interval_seconds) * 1000) return;
         operation_id = ++state.operation_id;
         state.busy = true;
         state.status = "Refreshing " + std::string(provider_label(provider_index)) + "...";
@@ -1717,6 +1736,7 @@ void draw_panel() {
     g_ui.dock_rect = {dx, dy, static_cast<float>(kDockWidth), dock_h};
     g_ui.callout_pin_button = {};
     g_ui.settings_fill_toggle = {};
+    g_ui.settings_refresh_interval = {};
     for (int i = 0; i < kProviderCount; ++i) {
         g_ui.model_callout_rect[i] = {};
         g_ui.model_pin_button[i] = {};
@@ -1747,7 +1767,7 @@ void draw_panel() {
     g_ui.gear_button = {dx + 8, footer_y, 36, 36};
     g_ui.pin_button = {dx + 48, footer_y, 36, 36};
     draw_gear_icon(g_ui.gear_button, g_ui.gear_hot);
-    draw_pin_icon(g_ui.pin_button, g_ui.pinned || any_model_pinned_open(), g_ui.pin_hot);
+    draw_pin_icon(g_ui.pin_button, g_ui.pinned, g_ui.pin_hot);
     bool left_open = left_sheet_open();
     if (left_open && g_ui.settings_anim > 0.02f) {
         Uint8 alpha = static_cast<Uint8>(std::clamp(g_ui.settings_anim, 0.0f, 1.0f) * 255.0f);
@@ -1810,7 +1830,11 @@ void draw_panel() {
                 g_ui.settings_fill_toggle = {card_x + 210, fill_y + 12, 36, 22};
                 aa_round_rect(g_ui.settings_fill_toggle, 11, g_ui.show_remaining ? color(48, 209, 88) : color(58, 58, 62), g_ui.show_remaining ? color(48, 209, 88) : color(58, 58, 62));
                 fill_round({g_ui.settings_fill_toggle.x + (g_ui.show_remaining ? 18.0f : 4.0f), fill_y + 15, 16, 16}, 8, 245, 245, 247);
-                float add_y = fill_y + 40;
+                float interval_y = fill_y + 40;
+                text(card_x + 18, interval_y + 8, "Refresh interval", 245, 245, 247, true, true);
+                g_ui.settings_refresh_interval = {card_x + 210, interval_y + 4, 100, 30};
+                button(g_ui.settings_refresh_interval, refresh_interval_label(g_ui.refresh_interval_seconds), true);
+                float add_y = fill_y + 84;
                 int hidden_n = 0;
                 for (int k = 0; k < kKindCount; ++k) {
                     if (g_app.listed[k]) continue;
@@ -1924,9 +1948,9 @@ void card_window_position(int index, int* x, int* y, bool* tail_right) {
 }
 
 void sync_card_windows() {
-    bool wanted = g_ui.visible && !left_sheet_open();
+    bool wanted = !left_sheet_open();
     for (int i = 0; i < kProviderCount; ++i) {
-        bool show = wanted && g_ui.model_open[i];
+        bool show = wanted && g_ui.model_open[i] && (g_ui.visible || g_ui.model_pinned[i]);
         if (!show) {
             if (g_ui.card_window_visible[i] && g_ui.card_window[i]) SDL_HideWindow(g_ui.card_window[i]);
             g_ui.card_window_visible[i] = false;
@@ -2111,6 +2135,7 @@ void save_layout() {
         }
     }
     json += ",\"remain\":" + std::string(g_ui.show_remaining ? "1" : "0");
+    json += ",\"refresh_seconds\":" + std::to_string(g_ui.refresh_interval_seconds);
     json += "}";
     try { credential_save_named("layout", json); } catch (const std::exception&) { }
 }
@@ -2288,6 +2313,11 @@ void handle_click(float x, float y) {
     if (g_ui.settings_open) {
         if (contains(g_ui.settings_fill_toggle, x, y)) {
             g_ui.show_remaining = !g_ui.show_remaining;
+            save_layout();
+            return;
+        }
+        if (contains(g_ui.settings_refresh_interval, x, y)) {
+            g_ui.refresh_interval_seconds = next_refresh_interval(g_ui.refresh_interval_seconds);
             save_layout();
             return;
         }
@@ -2523,6 +2553,13 @@ void load_layout() {
     auto raw = credential_load_named("layout");
     if (!raw) return;
     if (auto remain = json_number(*raw, "remain")) g_ui.show_remaining = *remain != 0;
+    if (auto refresh = json_number(*raw, "refresh_seconds")) {
+        int value = static_cast<int>(*refresh);
+        if (valid_refresh_interval(value)) g_ui.refresh_interval_seconds = value;
+    } else if (auto refresh = json_number(*raw, "refresh")) {
+        int value = static_cast<int>(*refresh) * 60;
+        if (valid_refresh_interval(value)) g_ui.refresh_interval_seconds = value;
+    }
     std::lock_guard<std::mutex> lock(g_app.mutex);
     for (int i = 0; i < kKindCount; ++i) {
         if (auto flag = json_number(*raw, "l" + std::to_string(i))) g_app.listed[i] = *flag != 0;
@@ -2762,7 +2799,7 @@ int main(int argc, char** argv) {
             if (g_ui.target_height != wanted_height || g_ui.panel_height != g_ui.target_height) apply_layout();
         }
 
-        if (now_ms() - last_poll > 5 * 60 * 1000) {
+        if (now_ms() - last_poll > static_cast<long long>(g_ui.refresh_interval_seconds) * 1000) {
             last_poll = now_ms();
             for (int i = 0; i < kProviderCount; ++i) {
                 if (provider_has_auth(i)) refresh_usage_async_for(i);
