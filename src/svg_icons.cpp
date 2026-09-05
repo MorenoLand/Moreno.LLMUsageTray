@@ -64,6 +64,8 @@ static std::string find_svg(const char* name) {
     std::string candidates[] = {
         exe + "/icons/" + name,
         exe + "\\icons\\" + name,
+        exe + "/../Resources/icons/" + name,
+        exe + "/../../Resources/icons/" + name,
         std::string("icons/") + name,
         std::string("resources/icons/") + name,
         std::string("G:/Development/c++/LLMUsageTray/resources/icons/") + name,

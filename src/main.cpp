@@ -232,10 +232,14 @@ int panel_width_px() { return static_cast<int>(std::round(layout_width() * g_ui.
 int panel_height_px() { return static_cast<int>(std::round(g_ui.panel_height * g_ui.panel_scale)); }
 
 float window_panel_scale() {
+#if defined(__APPLE__)
+    return 1.0f;
+#else
     SDL_Rect bounds{};
     SDL_DisplayID display = SDL_GetDisplayForWindow(g_ui.window);
     float resolution_scale = display && SDL_GetDisplayBounds(display, &bounds) ? std::clamp(static_cast<float>(bounds.h) / 1440.0f, 1.0f, 1.5f) : 1.0f;
     return std::max(SDL_GetWindowDisplayScale(g_ui.window), resolution_scale);
+#endif
 }
 
 void window_to_logical(float wx, float wy, float* lx, float* ly) {
