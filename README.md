@@ -73,7 +73,7 @@ Run `LLMUsageTray.exe`. It starts in the system tray.
 
 The popup is a compact ring dock plus a detail card:
 
-- one ring per enabled provider, showing that provider's primary window as percent used
+- one ring per enabled provider, showing that provider's primary window as percent remaining by default (toggleable to used)
 - click a ring for the callout (session/CLI and weekly/Bot bars, reset times)
 - gear opens Settings to enable providers, sign in or out, and refresh
 - pin keeps the popup open; drag the cards to reposition

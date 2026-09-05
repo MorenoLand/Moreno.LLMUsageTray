@@ -99,10 +99,17 @@ else()
     target_link_libraries(LLMUsageTray PRIVATE CURL::libcurl)
 endif()
 
-add_custom_command(TARGET LLMUsageTray POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons"
-        "$<TARGET_FILE_DIR:LLMUsageTray>/icons")
+if(APPLE)
+    add_custom_command(TARGET LLMUsageTray POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons"
+            "$<TARGET_BUNDLE_DIR:LLMUsageTray>/Contents/Resources/icons")
+else()
+    add_custom_command(TARGET LLMUsageTray POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons"
+            "$<TARGET_FILE_DIR:LLMUsageTray>/icons")
+endif()
 
 if(APPLE)
     set_target_properties(LLMUsageTray PROPERTIES

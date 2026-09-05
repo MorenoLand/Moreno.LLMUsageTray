@@ -169,7 +169,7 @@ struct UiState {
     float model_off_y[kProviderCount]{};
     float model_anim[kProviderCount]{};
     float slot_anim[kProviderCount]{};
-    bool show_remaining = false;
+    bool show_remaining = true;
     int refresh_interval_seconds = kDefaultRefreshIntervalSeconds;
     int oauth_slot = 3;
     int api_key_slot = 2;
