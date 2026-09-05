@@ -26,6 +26,7 @@ void save_credentials(const OAuthCredentials& credentials);
 void clear_credentials();
 bool credentials_expired(const OAuthCredentials& credentials);
 
+std::string oauth_provider_kind(const std::string& name);
 OAuthCredentials oauth_login_browser_provider(const std::string& provider);
 OAuthLoginSession oauth_begin_manual_login_provider(const std::string& provider);
 OAuthCredentials oauth_finish_manual_login_provider(const OAuthLoginSession& session, const std::string& code);

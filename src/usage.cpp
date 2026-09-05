@@ -247,12 +247,37 @@ static double glm_percent(const std::string& obj) {
     return 0;
 }
 
+static std::string object_around(const std::string& body, std::size_t pos) {
+    std::size_t start = body.rfind('{', pos);
+    if (start == std::string::npos) return "";
+    int depth = 0;
+    bool quoted = false;
+    bool escaped = false;
+    for (std::size_t i = start; i < body.size(); ++i) {
+        char c = body[i];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') quoted = false;
+        } else if (c == '"') quoted = true;
+        else if (c == '{') ++depth;
+        else if (c == '}' && --depth == 0) return body.substr(start, i - start + 1);
+    }
+    return "";
+}
+
 static RateWindow parse_glm_window(const std::string& body, const std::string& type, int unit = 0) {
-    std::string data = object_for_key(body, "data");
-    std::string limits = array_for_key(data.empty() ? body : data, "limits");
-    if (limits.empty()) limits = array_for_key(body, "limits");
-    for (const std::string& obj : objects_in_array(limits)) {
-        if (json_string(obj, "type").value_or("") != type) continue;
+    std::string needle = "\"type\":\"" + type + "\"";
+    std::string needle_sp = "\"type\": \"" + type + "\"";
+    std::size_t pos = 0;
+    while (pos < body.size()) {
+        std::size_t a = body.find(needle, pos);
+        std::size_t b = body.find(needle_sp, pos);
+        std::size_t at = a == std::string::npos ? b : (b == std::string::npos ? a : std::min(a, b));
+        if (at == std::string::npos) break;
+        std::string obj = object_around(body, at);
+        pos = at + 1;
+        if (obj.empty()) continue;
         if (unit && static_cast<int>(json_number(obj, "unit").value_or(0)) != unit) continue;
         RateWindow window;
         window.available = true;
@@ -453,8 +478,9 @@ UsageInfo fetch_usage_with_auth() {
 }
 
 UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
-    if (provider == "glm") {
-        auto api_key = load_api_key_provider("glm");
+    std::string kind = oauth_provider_kind(provider);
+    if (kind == "glm") {
+        auto api_key = load_api_key_provider(provider);
         if (!api_key) {
             throw std::runtime_error("No GLM API key saved");
         }
@@ -473,15 +499,16 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         info.email = "GLM API key";
         info.plan_type = "API";
         info.primary = parse_glm_window(res.body, "TOKENS_LIMIT", 3);
-        info.secondary = parse_glm_window(res.body, "TOKENS_LIMIT", 6);
-        info.tertiary = parse_glm_window(res.body, "TIME_LIMIT");
+        if (!info.primary.available) info.primary = parse_glm_window(res.body, "TOKENS_LIMIT");
+        info.secondary = parse_glm_window(res.body, "TIME_LIMIT");
+        info.tertiary = parse_glm_window(res.body, "TOKENS_LIMIT", 6);
         return info;
     }
     auto credentials = load_credentials_provider(provider);
     if (!credentials) {
         throw std::runtime_error("Not logged in");
     }
-    if (provider == "gemini") {
+    if (kind == "gemini") {
         if (auto local = fetch_agy_local_quota_summary()) {
             diagnostics_log_raw("agy local quota summary raw_body", *local);
             return parse_gemini_summary(*local);
@@ -492,7 +519,7 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         credentials = oauth_refresh_provider(provider, credentials->refresh);
     }
 
-    if (provider == "grok") {
+    if (kind == "grok") {
         auto headers = grok_headers(credentials->access);
         HttpResponse res = http_get(kGrokBillingUrl, headers);
         diagnostics_log("grok billing status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()));
@@ -509,7 +536,7 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         return parse_grok_usage(res.body, plan, credentials->account_id);
     }
 
-    if (provider == "gemini") {
+    if (kind == "gemini") {
         if (credentials->account_id.empty()) {
             credentials->account_id = gemini_discover_project(credentials->access);
             save_credentials_provider(provider, *credentials);
@@ -539,7 +566,7 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         return parse_gemini_usage(res.body);
     }
 
-    if (provider == "anthropic") {
+    if (kind == "anthropic") {
         HttpResponse res = http_get(kClaudeUsageUrl, {
             {"Authorization", "Bearer " + credentials->access},
             {"anthropic-beta", "oauth-2025-04-20"},
@@ -579,8 +606,9 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
 }
 
 void warm_provider(const std::string& provider) {
-    if (provider == "glm") {
-        auto api_key = load_api_key_provider("glm");
+    std::string kind = oauth_provider_kind(provider);
+    if (kind == "glm") {
+        auto api_key = load_api_key_provider(provider);
         if (!api_key) throw std::runtime_error("No GLM API key saved");
         std::string body = R"({"model":"glm-5","messages":[{"role":"user","content":"."}]})";
         HttpResponse res = http_post_json(kGlmChatUrl, body, {
@@ -599,7 +627,7 @@ void warm_provider(const std::string& provider) {
         credentials = oauth_refresh_provider(provider, credentials->refresh);
     }
 
-    if (provider == "grok") {
+    if (kind == "grok") {
         std::string body = R"({"model":"grok-build-0.1","max_tokens":1,"messages":[{"role":"user","content":"."}]})";
         HttpResponse res = http_post_json(kGrokChatUrl, body, grok_headers(credentials->access));
         if (res.status < 200 || res.status >= 300) {
@@ -608,7 +636,7 @@ void warm_provider(const std::string& provider) {
         return;
     }
 
-    if (provider == "anthropic") {
+    if (kind == "anthropic") {
         std::string body = "{";
         body += "\"model\":\"claude-sonnet-4-6\",";
         body += "\"max_tokens\":1,";

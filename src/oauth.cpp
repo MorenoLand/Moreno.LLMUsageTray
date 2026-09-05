@@ -411,26 +411,36 @@ std::string gemini_discover_project(const std::string& access_token) {
     throw std::runtime_error("Gemini project discovery failed");
 }
 
+std::string oauth_provider_kind(const std::string& name) {
+    std::size_t p = name.rfind('_');
+    if (p == std::string::npos || p == 0 || p + 1 >= name.size()) return name;
+    for (std::size_t i = p + 1; i < name.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(name[i]))) return name;
+    }
+    return name.substr(0, p);
+}
+
 OAuthCredentials oauth_login_browser() {
     return oauth_login_browser_provider("openai");
 }
 
 OAuthCredentials oauth_login_browser_provider(const std::string& provider) {
-    if (provider == "glm") {
+    std::string kind = oauth_provider_kind(provider);
+    if (kind == "glm") {
         throw std::runtime_error("GLM OAuth is not configured yet");
     }
-    std::string verifier = base64url_encode(random_bytes(provider == "grok" ? 96 : 32));
+    std::string verifier = base64url_encode(random_bytes(kind == "grok" ? 96 : 32));
     std::string challenge = base64url_encode(sha256_bytes(verifier));
-    std::string state = provider == "anthropic" ? verifier : base64url_encode(random_bytes(16));
-    std::string url = provider == "anthropic"
+    std::string state = kind == "anthropic" ? verifier : base64url_encode(random_bytes(16));
+    std::string url = kind == "anthropic"
         ? create_anthropic_authorize_url(challenge, state)
-        : (provider == "grok" ? create_grok_authorize_url(challenge, state) : create_authorize_url(challenge, state));
+        : (kind == "grok" ? create_grok_authorize_url(challenge, state) : create_authorize_url(challenge, state));
 
-    auto code_future = std::async(std::launch::async, [provider, state] {
-        if (provider == "anthropic") {
+    auto code_future = std::async(std::launch::async, [kind, state] {
+        if (kind == "anthropic") {
             return wait_for_oauth_code_on(53692, "/callback", state, "Claude");
         }
-        if (provider == "grok") {
+        if (kind == "grok") {
             return wait_for_oauth_code_on(56121, "/callback", state, "Grok");
         }
         return wait_for_oauth_code_on(1455, "/auth/callback", state, "ChatGPT");
@@ -438,9 +448,9 @@ OAuthCredentials oauth_login_browser_provider(const std::string& provider) {
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     open_browser(url);
     std::string code = code_future.get();
-    OAuthCredentials credentials = provider == "anthropic"
+    OAuthCredentials credentials = kind == "anthropic"
         ? exchange_anthropic_code(code, verifier)
-        : (provider == "grok" ? exchange_grok_code(code, verifier) : exchange_code(code, verifier));
+        : (kind == "grok" ? exchange_grok_code(code, verifier) : exchange_code(code, verifier));
     save_credentials_provider(provider, credentials);
     return credentials;
 }
@@ -448,7 +458,8 @@ OAuthCredentials oauth_login_browser_provider(const std::string& provider) {
 OAuthLoginSession oauth_begin_manual_login_provider(const std::string& provider) {
     OAuthLoginSession session;
     session.provider = provider;
-    if (provider == "grok") {
+    std::string kind = oauth_provider_kind(provider);
+    if (kind == "grok") {
         session.verifier = base64url_encode(random_bytes(96));
         session.state = base64url_encode(random_bytes(16));
         session.client_id = kGrokClientId;
@@ -457,7 +468,7 @@ OAuthLoginSession oauth_begin_manual_login_provider(const std::string& provider)
         open_browser(session.authorize_url);
         return session;
     }
-    if (provider != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini and Grok");
+    if (kind != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini and Grok");
     GeminiOAuthConfig config = gemini_oauth_config();
     session.verifier = base64url_encode(random_bytes(32));
     session.state = base64url_encode(random_bytes(16));
@@ -470,13 +481,14 @@ OAuthLoginSession oauth_begin_manual_login_provider(const std::string& provider)
 }
 
 OAuthCredentials oauth_finish_manual_login_provider(const OAuthLoginSession& session, const std::string& code) {
-    if (session.provider == "grok") {
+    std::string kind = oauth_provider_kind(session.provider);
+    if (kind == "grok") {
         diagnostics_log("grok oauth code submit length=" + std::to_string(code.size()));
         OAuthCredentials credentials = exchange_grok_code(code, session.verifier);
         save_credentials_provider(session.provider, credentials);
         return credentials;
     }
-    if (session.provider != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini and Grok");
+    if (kind != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini and Grok");
     if (session.client_id.empty() || session.client_secret.empty()) throw std::runtime_error("Gemini OAuth session is missing client configuration");
     GeminiOAuthConfig config{session.client_id, session.client_secret};
     diagnostics_log("gemini oauth code submit length=" + std::to_string(code.size()));
@@ -492,10 +504,11 @@ OAuthCredentials oauth_refresh(const std::string& refresh_token) {
 }
 
 OAuthCredentials oauth_refresh_provider(const std::string& provider, const std::string& refresh_token) {
-    if (provider == "glm") {
+    std::string kind = oauth_provider_kind(provider);
+    if (kind == "glm") {
         throw std::runtime_error("GLM OAuth is not configured yet");
     }
-    if (provider == "anthropic") {
+    if (kind == "anthropic") {
         std::string body = "{";
         body += "\"grant_type\":\"refresh_token\",";
         body += "\"client_id\":\"" + json_escape(kAnthropicClientId) + "\",";
@@ -518,7 +531,7 @@ OAuthCredentials oauth_refresh_provider(const std::string& provider, const std::
         save_credentials_provider(provider, credentials);
         return credentials;
     }
-    if (provider == "gemini") {
+    if (kind == "gemini") {
         GeminiOAuthConfig config = gemini_oauth_config();
         HttpResponse res = http_post_form(kGeminiTokenUrl, {
             {"grant_type", "refresh_token"},
@@ -542,7 +555,7 @@ OAuthCredentials oauth_refresh_provider(const std::string& provider, const std::
         save_credentials_provider(provider, credentials);
         return credentials;
     }
-    if (provider == "grok") {
+    if (kind == "grok") {
         HttpResponse res = http_post_form(kGrokTokenUrl, {
             {"grant_type", "refresh_token"},
             {"refresh_token", refresh_token},
@@ -594,7 +607,7 @@ std::optional<OAuthCredentials> load_credentials() {
 }
 
 std::optional<OAuthCredentials> load_credentials_provider(const std::string& provider) {
-    if (provider == "glm") return std::nullopt;
+    if (oauth_provider_kind(provider) == "glm") return std::nullopt;
     auto raw = credential_load_named(provider);
     if (!raw) return std::nullopt;
     OAuthCredentials credentials;

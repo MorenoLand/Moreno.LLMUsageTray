@@ -39,6 +39,7 @@ set(LLM_USAGE_TRAY_SOURCES
     src/json_util.cpp
     src/oauth.cpp
     src/usage.cpp
+    src/svg_icons.cpp
 )
 
 if(WIN32)
@@ -92,10 +93,16 @@ if(WIN32)
         advapi32
         ws2_32
         shell32
+        dwmapi
     )
 else()
     target_link_libraries(LLMUsageTray PRIVATE CURL::libcurl)
 endif()
+
+add_custom_command(TARGET LLMUsageTray POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons"
+        "$<TARGET_FILE_DIR:LLMUsageTray>/icons")
 
 if(APPLE)
     set_target_properties(LLMUsageTray PROPERTIES

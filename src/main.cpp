@@ -68,7 +68,9 @@ constexpr int kSettingsRowHeight = 52;
 constexpr int kSettingsHeader = 48;
 constexpr int kSettingsExtra = 44;
 constexpr int kSettingsFooter = 56;
-constexpr int kProviderCount = 5;
+constexpr int kKindCount = 5;
+constexpr int kMaxSlots = 10;
+constexpr int kProviderCount = kMaxSlots;
 constexpr int kCardRadius = 20;
 constexpr int kDockRadius = 24;
 
@@ -105,6 +107,10 @@ struct AppState {
     std::mutex mutex;
     ProviderState providers[kProviderCount];
     bool enabled[kProviderCount] = {true, true, false, false, true};
+    int slot_kind[kProviderCount] = {0, 1, 2, 3, 4, -1, -1, -1, -1, -1};
+    int slot_acct[kProviderCount]{};
+    int dock_order[kProviderCount] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    bool listed[kKindCount] = {true, true, true, true, true};
     int selected = 0;
 };
 
@@ -150,11 +156,29 @@ struct UiState {
     bool model_open[kProviderCount]{};
     bool model_pinned[kProviderCount]{};
     bool model_detached[kProviderCount]{};
-    float model_callout_y[kProviderCount]{-1, -1, -1, -1, -1};
+    float model_off_x[kProviderCount]{};
+    float model_off_y[kProviderCount]{};
+    float model_anim[kProviderCount]{};
     bool show_remaining = false;
+    int oauth_slot = 3;
+    int api_key_slot = 2;
     int dragging_model = -1;
+    int reorder_slot = -1;
+    int pending_ring = -1;
+    int grab_x = 0;
+    int grab_y = 0;
+    float press_x = 0;
+    float press_y = 0;
+    float dock_ox = static_cast<float>(kCalloutWidth + kCardGap + kTailWidth);
+    float dock_oy = 0;
+    int layout_w = kPanelWidth;
+    int dock_anchor_x = 0;
+    int dock_anchor_y = 0;
     Rect settings_toggle[kProviderCount];
     Rect settings_action[kProviderCount];
+    Rect settings_add[kKindCount];
+    Rect settings_remove[kProviderCount];
+    Rect settings_add_kind[kKindCount];
     Rect settings_quit, settings_refresh, settings_fill_toggle;
     Rect api_input, api_ok, api_cancel;
     Rect oauth_code_input_box, oauth_code_ok, oauth_code_cancel;
@@ -180,7 +204,7 @@ std::atomic_bool g_refresh_requested{false};
 std::atomic_bool g_warm_requested{false};
 
 int layout_width() {
-    return kPanelWidth;
+    return std::max(kDockWidth, g_ui.layout_w);
 }
 int panel_width_px() { return static_cast<int>(std::round(layout_width() * g_ui.panel_scale)); }
 int panel_height_px() { return static_cast<int>(std::round(g_ui.panel_height * g_ui.panel_scale)); }
@@ -220,44 +244,127 @@ long long now_ms() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+int kind_of(int slot) {
+    if (slot < 0 || slot >= kMaxSlots) return -1;
+    return g_app.slot_kind[slot];
+}
+
+int acct_of(int slot) {
+    if (slot < 0 || slot >= kMaxSlots) return 0;
+    return g_app.slot_acct[slot];
+}
+
+bool slot_live(int slot) {
+    return kind_of(slot) >= 0;
+}
+
+bool slot_shown(int slot) {
+    int kind = kind_of(slot);
+    if (kind < 0) return false;
+    if (slot < kKindCount && !g_app.listed[kind]) return false;
+    return g_app.enabled[slot];
+}
+
+int collect_visible(int* out) {
+    int n = 0;
+    bool enabled[kProviderCount]{};
+    int order[kProviderCount]{};
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        for (int i = 0; i < kProviderCount; ++i) {
+            enabled[i] = g_app.enabled[i];
+            order[i] = g_app.dock_order[i];
+        }
+    }
+    for (int k = 0; k < kProviderCount; ++k) {
+        int i = order[k];
+        if (i < 0 || i >= kProviderCount) continue;
+        if (!enabled[i] || kind_of(i) < 0) continue;
+        if (!g_app.listed[kind_of(i)]) continue;
+        if (out) out[n] = i;
+        ++n;
+    }
+    return n;
+}
+
+void swap_dock_order(int a, int b) {
+    if (a == b) return;
+    std::lock_guard<std::mutex> lock(g_app.mutex);
+    int pa = -1, pb = -1;
+    for (int i = 0; i < kProviderCount; ++i) {
+        if (g_app.dock_order[i] == a) pa = i;
+        if (g_app.dock_order[i] == b) pb = i;
+    }
+    if (pa < 0 || pb < 0) return;
+    std::swap(g_app.dock_order[pa], g_app.dock_order[pb]);
+}
+
+int slot_at_dock_y(float y) {
+    int vis[kProviderCount];
+    int n = collect_visible(vis);
+    if (n <= 0) return -1;
+    float local = y - g_ui.dock_oy - static_cast<float>(kDockPad);
+    int idx = static_cast<int>(std::floor(local / static_cast<float>(kRingSlot)));
+    idx = std::clamp(idx, 0, n - 1);
+    return vis[idx];
+}
+
+const char* kind_key(int kind) {
+    if (kind == 4) return "grok";
+    if (kind == 3) return "gemini";
+    if (kind == 2) return "glm";
+    return kind == 1 ? "anthropic" : "openai";
+}
+
 const char* provider_key(int index) {
-    if (index == 4) return "grok";
-    if (index == 3) return "gemini";
-    if (index == 2) return "glm";
-    return index == 1 ? "anthropic" : "openai";
+    return kind_key(kind_of(index));
+}
+
+std::string store_key(int slot) {
+    int kind = kind_of(slot);
+    int acct = acct_of(slot);
+    if (kind < 0) return "";
+    if (acct <= 0) return kind_key(kind);
+    return std::string(kind_key(kind)) + "_" + std::to_string(acct);
 }
 
 const char* provider_label(int index) {
-    if (index == 4) return "Grok";
-    if (index == 3) return "Gemini";
-    if (index == 2) return "GLM";
-    return index == 1 ? "Claude" : "GPT";
+    int kind = kind_of(index);
+    if (kind == 4) return "Grok";
+    if (kind == 3) return "Gemini";
+    if (kind == 2) return "GLM";
+    return kind == 1 ? "Claude" : "GPT";
 }
 
 const char* primary_row_label(int index) {
-    if (index == 4) return "Grok CLI";
-    if (index == 2) return "5 hour";
-    if (index == 3) return "5 hour";
+    int kind = kind_of(index);
+    if (kind == 4) return "Grok CLI";
+    if (kind == 2) return "5 hour";
+    if (kind == 3) return "5 hour";
     return "Current session";
 }
 
 const char* secondary_row_label(int index) {
-    if (index == 4) return "Grok Bot";
-    if (index == 2) return "Weekly";
-    if (index == 3) return "Weekly";
+    int kind = kind_of(index);
+    if (kind == 4) return "Grok Bot";
+    if (kind == 2) return "Requests";
+    if (kind == 3) return "Weekly";
     return "All models";
 }
 
 SDL_Color provider_accent(int index) {
-    if (index == 1) return SDL_Color{232, 114, 42, 255};
-    if (index == 2) return SDL_Color{45, 212, 191, 255};
-    if (index == 3) return SDL_Color{168, 139, 250, 255};
-    if (index == 4) return SDL_Color{236, 236, 239, 255};
+    int kind = kind_of(index);
+    if (kind == 1) return SDL_Color{232, 114, 42, 255};
+    if (kind == 2) return SDL_Color{45, 212, 191, 255};
+    if (kind == 3) return SDL_Color{168, 139, 250, 255};
+    if (kind == 4) return SDL_Color{236, 236, 239, 255};
     return SDL_Color{232, 232, 234, 255};
 }
 
 bool provider_has_auth(int index) {
-    return index == 2 ? load_api_key_provider("glm").has_value() : load_credentials_provider(provider_key(index)).has_value();
+    std::string store = store_key(index);
+    if (kind_of(index) == 2) return load_api_key_provider(store).has_value();
+    return load_credentials_provider(store).has_value();
 }
 
 std::string trim_copy(std::string value) {
@@ -283,8 +390,17 @@ bool contains(Rect r, float x, float y) {
 }
 
 float dock_x() {
-    return static_cast<float>(kCalloutWidth + kCardGap + kTailWidth);
+    return g_ui.dock_ox;
 }
+
+float snap_off_x() {
+    return -static_cast<float>(kCalloutWidth + kCardGap + kTailWidth);
+}
+
+float snap_callout_x() {
+    return g_ui.dock_ox + snap_off_x();
+}
+int dock_height();
 int settings_height();
 
 bool left_sheet_open() {
@@ -311,30 +427,36 @@ double display_percent(double used) {
 }
 
 float ring_cy_for(int index) {
-    bool enabled[kProviderCount]{};
-    {
-        std::lock_guard<std::mutex> lock(g_app.mutex);
-        for (int i = 0; i < kProviderCount; ++i) enabled[i] = g_app.enabled[i];
+    int vis[kProviderCount];
+    int n = collect_visible(vis);
+    for (int k = 0; k < n; ++k) {
+        if (vis[k] == index) return g_ui.dock_oy + static_cast<float>(kDockPad + k * kRingSlot + kRingSize * 0.5f);
     }
-    int n = 0;
-    for (int i = 0; i < kProviderCount; ++i) {
-        if (!enabled[i]) continue;
-        if (i == index) return static_cast<float>(kDockPad + n * kRingSlot + kRingSize * 0.5f);
-        ++n;
-    }
-    return static_cast<float>(kDockPad + kRingSize * 0.5f);
+    return g_ui.dock_oy + static_cast<float>(kDockPad + kRingSize * 0.5f);
+}
+
+float snap_off_y(int index) {
+    float h = static_cast<float>(kCalloutHeight);
+    float y = ring_cy_for(index) - g_ui.dock_oy - h * 0.5f;
+    float maxy = std::max(0.0f, static_cast<float>(dock_height()) - h);
+    return std::clamp(y, 0.0f, maxy);
 }
 
 float snap_callout_y(int index) {
-    float h = static_cast<float>(kCalloutHeight);
-    return std::clamp(ring_cy_for(index) - h * 0.5f, 0.0f, std::max(0.0f, static_cast<float>(g_ui.panel_height) - h));
+    return g_ui.dock_oy + snap_off_y(index);
+}
+
+bool callout_floating(int index) {
+    return g_ui.dragging_model == index || g_ui.model_pinned[index] || g_ui.model_detached[index];
+}
+
+float callout_x_for(int index) {
+    if (callout_floating(index)) return g_ui.dock_ox + g_ui.model_off_x[index];
+    return snap_callout_x();
 }
 
 float callout_y_for(int index) {
-    float h = static_cast<float>(kCalloutHeight);
-    if ((g_ui.dragging_model == index || g_ui.model_pinned[index] || g_ui.model_detached[index]) && g_ui.model_callout_y[index] >= 0) {
-        return std::clamp(g_ui.model_callout_y[index], 0.0f, std::max(0.0f, static_cast<float>(g_ui.panel_height) - h));
-    }
+    if (callout_floating(index)) return g_ui.dock_oy + g_ui.model_off_y[index];
     return snap_callout_y(index);
 }
 
@@ -349,9 +471,7 @@ void left_card_geom(float* y, float* h) {
 }
 
 int enabled_count() {
-    int n = 0;
-    for (int i = 0; i < kProviderCount; ++i) if (g_app.enabled[i]) ++n;
-    return n;
+    return collect_visible(nullptr);
 }
 
 int dock_height() {
@@ -364,8 +484,26 @@ int dock_height() {
     return kDockPad + n * kRingSlot + kDockFooter;
 }
 
+int extra_slot_count() {
+    int n = 0;
+    for (int i = kKindCount; i < kMaxSlots; ++i) if (kind_of(i) >= 0) ++n;
+    return n;
+}
+
+int listed_kind_count() {
+    int n = 0;
+    for (int i = 0; i < kKindCount; ++i) if (g_app.listed[i]) ++n;
+    return n;
+}
+
+int hidden_kind_count() {
+    return kKindCount - listed_kind_count();
+}
+
 int settings_height() {
-    return kSettingsHeader + kProviderCount * kSettingsRowHeight + kSettingsExtra + kSettingsFooter;
+    int rows = listed_kind_count() + extra_slot_count();
+    int add = hidden_kind_count() > 0 ? 44 : 0;
+    return kSettingsHeader + rows * kSettingsRowHeight + kSettingsExtra + add + kSettingsFooter;
 }
 
 std::tm localtime_portable(std::time_t t) {
@@ -544,11 +682,11 @@ void update_render_metrics(bool reload_fonts = true) {
 }
 
 int wanted_panel_height() {
-    int dock = dock_height();
-    if (g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode) return std::max(dock, settings_height());
+    int dock = dock_height() + static_cast<int>(std::ceil(g_ui.dock_oy));
+    if (g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode) return std::max(dock, settings_height() + static_cast<int>(std::ceil(g_ui.dock_oy)));
     int height = dock;
     for (int i = 0; i < kProviderCount; ++i) {
-        if (!g_ui.model_open[i]) continue;
+        if (!g_ui.model_open[i] && g_ui.model_anim[i] < 0.02f) continue;
         height = std::max(height, static_cast<int>(std::ceil(callout_y_for(i) + static_cast<float>(kCalloutHeight) + 8.0f)));
     }
     return height;
@@ -589,6 +727,58 @@ void set_target_height(int height, bool immediate = false) {
     update_window_shape();
 }
 
+void capture_dock_anchor() {
+    if (!g_ui.window) return;
+    int wx = 0, wy = 0;
+    SDL_GetWindowPosition(g_ui.window, &wx, &wy);
+    g_ui.dock_anchor_x = wx + static_cast<int>(std::round(g_ui.dock_ox * g_ui.panel_scale));
+    g_ui.dock_anchor_y = wy + static_cast<int>(std::round(g_ui.dock_oy * g_ui.panel_scale));
+}
+
+void apply_layout() {
+    float scale = std::max(0.01f, g_ui.panel_scale);
+    int dsx = g_ui.dock_anchor_x;
+    int dsy = g_ui.dock_anchor_y;
+    int dw = std::max(1, static_cast<int>(std::lround(static_cast<float>(kDockWidth) * scale)));
+    int dh = std::max(1, static_cast<int>(std::lround(static_cast<float>(dock_height()) * scale)));
+    int left = dsx, top = dsy, right = dsx + dw, bottom = dsy + dh;
+    auto include = [&](int x, int y, int w, int h) {
+        left = std::min(left, x);
+        top = std::min(top, y);
+        right = std::max(right, x + w);
+        bottom = std::max(bottom, y + h);
+    };
+    if (left_sheet_open()) {
+        int cw = static_cast<int>(std::lround(static_cast<float>(kCalloutWidth + kTailWidth) * scale));
+        int ch = static_cast<int>(std::lround(static_cast<float>(settings_height()) * scale));
+        include(dsx + static_cast<int>(std::lround(snap_off_x() * scale)), dsy, cw, ch);
+    }
+    for (int i = 0; i < kProviderCount; ++i) {
+        if (!g_ui.model_open[i] && g_ui.model_anim[i] < 0.02f) continue;
+        float ox = callout_floating(i) ? g_ui.model_off_x[i] : snap_off_x();
+        float oy = callout_floating(i) ? g_ui.model_off_y[i] : snap_off_y(i);
+        int cw = static_cast<int>(std::lround(static_cast<float>(kCalloutWidth + kTailWidth) * scale));
+        int ch = static_cast<int>(std::lround(static_cast<float>(kCalloutHeight + 8) * scale));
+        include(dsx + static_cast<int>(std::lround(ox * scale)), dsy + static_cast<int>(std::lround(oy * scale)), cw, ch);
+    }
+    bottom = std::max(bottom, dsy + dh);
+    right = std::max(right, dsx + dw);
+    int extra_left = dsx - left;
+    int extra_top = dsy - top;
+    g_ui.dock_ox = static_cast<float>(extra_left) / scale;
+    g_ui.dock_oy = static_cast<float>(extra_top) / scale;
+    g_ui.layout_w = std::max(kDockWidth, static_cast<int>(std::lround(static_cast<float>(right - left) / scale)));
+    int height = std::max(dock_height() + static_cast<int>(std::lround(g_ui.dock_oy)), static_cast<int>(std::lround(static_cast<float>(bottom - top) / scale)));
+    g_ui.target_height = height;
+    g_ui.panel_height = height;
+    if (!g_ui.window) return;
+    SDL_SetWindowSize(g_ui.window, panel_width_px(), panel_height_px());
+    SDL_SetWindowPosition(g_ui.window, left, top);
+    g_ui.anchor_bottom = top + panel_height_px();
+    update_render_metrics();
+    update_window_shape();
+}
+
 void close_menus() {
     g_ui.settings_open = false;
     for (int i = 0; i < kProviderCount; ++i) {
@@ -598,7 +788,7 @@ void close_menus() {
         }
     }
     sync_callout_open();
-    set_target_height(wanted_panel_height());
+    apply_layout();
 }
 
 void show_panel() {
@@ -607,6 +797,9 @@ void show_panel() {
     g_ui.shown_at_ms = now_ms();
     g_ui.settings_open = false;
     g_ui.callout_open = false;
+    g_ui.dock_ox = 0;
+    g_ui.dock_oy = 0;
+    g_ui.layout_w = kDockWidth;
     for (int i = 0; i < kProviderCount; ++i) {
         if (g_ui.model_pinned[i]) {
             g_ui.model_open[i] = true;
@@ -625,7 +818,8 @@ void show_panel() {
     SDL_GetGlobalMouseState(&mx, &my);
     g_ui.anchor_bottom = static_cast<int>(my) - static_cast<int>(std::round(12 * g_ui.panel_scale));
     SDL_SetWindowPosition(g_ui.window, static_cast<int>(mx) - panel_width_px() + static_cast<int>(std::round(20 * g_ui.panel_scale)), g_ui.anchor_bottom - panel_height_px());
-    update_window_shape();
+    capture_dock_anchor();
+    apply_layout();
     SDL_ShowWindow(g_ui.window);
     SDL_RaiseWindow(g_ui.window);
 }
@@ -641,7 +835,7 @@ void hide_panel() {
             }
         }
         sync_callout_open();
-        set_target_height(wanted_panel_height());
+        apply_layout();
         return;
     }
     g_ui.visible = false;
@@ -689,9 +883,19 @@ void tick_ui(float dt) {
         g_ui.hover_anim[i] = approach(g_ui.hover_anim[i], g_ui.hover_ring == i ? 1.0f : 0.0f, dt, 16.0f);
     }
     g_ui.gear_hot = approach(g_ui.gear_hot, g_ui.gear_hovered ? 1.0f : 0.0f, dt, 16.0f);
-    g_ui.pin_hot = approach(g_ui.pin_hot, (g_ui.pin_hovered || g_ui.pinned) ? 1.0f : 0.0f, dt, 16.0f);
+    g_ui.pin_hot = approach(g_ui.pin_hot, (g_ui.pin_hovered || g_ui.pinned || any_model_pinned_open()) ? 1.0f : 0.0f, dt, 16.0f);
+    bool relayout = false;
+    for (int i = 0; i < kProviderCount; ++i) {
+        float prev = g_ui.model_anim[i];
+        g_ui.model_anim[i] = approach(g_ui.model_anim[i], g_ui.model_open[i] ? 1.0f : 0.0f, dt, 11.0f);
+        if (!g_ui.model_open[i] && g_ui.model_anim[i] < 0.02f) {
+            g_ui.model_detached[i] = false;
+            if (prev >= 0.02f) relayout = true;
+        }
+    }
+    if (relayout) apply_layout();
     if (g_ui.oauth_code_mode) {
-        int index = g_ui.oauth_session.provider == "grok" ? 4 : 3;
+        int index = g_ui.oauth_slot;
         bool done = false;
         {
             std::lock_guard<std::mutex> lock(g_app.mutex);
@@ -705,7 +909,8 @@ void tick_ui(float dt) {
             set_target_height(wanted_panel_height());
         }
     }
-    bool left = g_ui.callout_open || left_sheet_open() || any_model_pinned_open();
+    bool left = left_sheet_open();
+    for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_anim[i] > 0.02f) left = true;
     g_ui.left_anim = approach(g_ui.left_anim, left ? 1.0f : 0.0f, dt, 13.0f);
     float target_y = 0, target_h = 0;
     left_card_geom(&target_y, &target_h);
@@ -725,7 +930,7 @@ void poll_dismiss() {
     bool down = (SDL_GetGlobalMouseState(&gx, &gy) & SDL_BUTTON_LMASK) != 0;
     bool pressed = down && !g_ui.prev_global_down;
     g_ui.prev_global_down = down;
-    if (!g_ui.visible || g_ui.dragging || g_ui.dragging_model >= 0 || g_ui.click_armed) return;
+    if (!g_ui.visible || g_ui.dragging || g_ui.dragging_model >= 0 || g_ui.reorder_slot >= 0 || g_ui.click_armed) return;
     if (now_ms() - g_ui.shown_at_ms < 800) return;
     if (!pressed) return;
     if (SDL_GetMouseFocus() == g_ui.window) return;
@@ -750,22 +955,23 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
 
     std::thread([provider_index, operation_id] {
         try {
-            UsageInfo info = fetch_usage_with_auth_provider(provider_key(provider_index));
+            UsageInfo info = fetch_usage_with_auth_provider(store_key(provider_index));
             std::lock_guard<std::mutex> lock(g_app.mutex);
             auto& state = g_app.providers[provider_index];
             if (state.operation_id != operation_id) return;
             state.logged_in = true;
             std::string plan = pretty_plan(info.plan_type);
-            if (provider_index == 1) {
+            int kind = kind_of(provider_index);
+            if (kind == 1) {
                 state.account = "Claude";
                 state.account_label = "Claude";
-            } else if (provider_index == 2) {
+            } else if (kind == 2) {
                 state.account = "GLM API key";
                 state.account_label = "GLM";
-            } else if (provider_index == 3) {
+            } else if (kind == 3) {
                 state.account = info.email.empty() ? "Gemini" : info.email;
                 state.account_label = "Gemini";
-            } else if (provider_index == 4) {
+            } else if (kind == 4) {
                 state.account = info.email.empty() ? (plan.empty() || plan == "unknown" ? "Grok" : plan) : info.email + " (" + plan + ")";
                 state.account_label = plan.empty() || plan == "unknown" ? "Grok" : plan;
             } else {
@@ -824,7 +1030,7 @@ int oauth_provider_index(const std::string& provider) {
 }
 
 void cancel_oauth_code_login() {
-    int index = oauth_provider_index(g_ui.oauth_session.provider);
+    int index = g_ui.oauth_slot;
     g_ui.oauth_code_mode = false;
     g_ui.oauth_code_input_focused = false;
     g_ui.oauth_code_input.clear();
@@ -840,7 +1046,7 @@ void cancel_oauth_code_login() {
 }
 
 void complete_oauth_code(std::string code, OAuthLoginSession session, unsigned long long operation_id) {
-    int index = oauth_provider_index(session.provider);
+    int index = g_ui.oauth_slot;
     std::thread([code = std::move(code), session = std::move(session), operation_id, index] {
         try {
             OAuthCredentials credentials = oauth_finish_manual_login_provider(session, code);
@@ -899,7 +1105,8 @@ void begin_oauth_code_login(int index) {
             state.busy = true;
             state.status = std::string("Waiting for ") + provider_label(index) + " verification code...";
         }
-        OAuthLoginSession session = oauth_begin_manual_login_provider(provider_key(index));
+        g_ui.oauth_slot = index;
+        OAuthLoginSession session = oauth_begin_manual_login_provider(store_key(index));
         g_ui.oauth_session = session;
         g_ui.oauth_code_mode = true;
         g_ui.oauth_code_input_focused = true;
@@ -907,7 +1114,7 @@ void begin_oauth_code_login(int index) {
         set_target_height(wanted_panel_height());
         SDL_StartTextInput(g_ui.window);
         if (!g_ui.visible) show_panel();
-        if (index == 4) {
+        if (kind_of(index) == 4) {
             std::thread([session, operation_id] {
                 try {
                     std::string code = wait_for_oauth_code_on(56121, "/callback", session.state, "Grok");
@@ -937,7 +1144,7 @@ void warm_async_for(int provider_index) {
 
     std::thread([provider_index, operation_id] {
         try {
-            warm_provider(provider_key(provider_index));
+            warm_provider(store_key(provider_index));
             {
                 std::lock_guard<std::mutex> lock(g_app.mutex);
                 auto& state = g_app.providers[provider_index];
@@ -958,11 +1165,13 @@ void warm_async_for(int provider_index) {
 }
 
 void login_async_for(int provider_index) {
-    if (provider_index == 3 || provider_index == 4) {
+    int kind = kind_of(provider_index);
+    if (kind == 3 || kind == 4) {
         begin_oauth_code_login(provider_index);
         return;
     }
-    if (provider_index == 2) {
+    if (kind == 2) {
+        g_ui.api_key_slot = provider_index;
         if (g_ui.visible) anchor_current_bottom();
         g_ui.api_key_mode = true;
         g_ui.api_input_focused = true;
@@ -985,7 +1194,7 @@ void login_async_for(int provider_index) {
 
     std::thread([provider_index, operation_id] {
         try {
-            oauth_login_browser_provider(provider_key(provider_index));
+            oauth_login_browser_provider(store_key(provider_index));
             {
                 std::lock_guard<std::mutex> lock(g_app.mutex);
                 auto& state = g_app.providers[provider_index];
@@ -1008,10 +1217,11 @@ void login_async_for(int provider_index) {
 void save_glm_key() {
     std::string key = trim_copy(g_ui.api_key_input);
     if (key.empty()) return;
-    save_api_key_provider("glm", key);
+    int slot = g_ui.api_key_slot;
+    save_api_key_provider(store_key(slot), key);
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
-        auto& state = g_app.providers[2];
+        auto& state = g_app.providers[slot];
         state.logged_in = true;
         state.account = "GLM API key";
         state.account_label = "GLM";
@@ -1022,7 +1232,7 @@ void save_glm_key() {
     g_ui.api_input_focused = false;
     set_target_height(wanted_panel_height());
     SDL_StopTextInput(g_ui.window);
-    refresh_usage_async_for(2, true);
+    refresh_usage_async_for(slot, true);
 }
 
 void set_color(Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) {
@@ -1310,32 +1520,48 @@ void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent) 
 }
 
 void draw_provider_glyph(float cx, float cy, int index, SDL_Color) {
-    icons_draw(icon_provider(index), cx, cy, 18.0f);
+    int kind = kind_of(index);
+    icons_draw(icon_provider(kind < 0 ? 0 : kind), cx, cy, 18.0f);
 }
 
 void draw_gear_icon(Rect r, float = 0) {
     icons_draw(icon_gear(), r.x + r.w * 0.5f, r.y + r.h * 0.5f, 18.0f);
 }
 
-void draw_pin_icon(Rect r, bool, float = 0) {
-    icons_draw(icon_pin(), r.x + r.w * 0.5f, r.y + r.h * 0.5f, 18.0f);
+void draw_pin_icon(Rect r, bool on, float = 0) {
+    SDL_Texture* texture = icon_pin();
+    if (on) fill_round({r.x + 4, r.y + 4, r.w - 8, r.h - 8}, 8, 48, 209, 88);
+    if (texture) SDL_SetTextureColorMod(texture, on ? 255 : 174, on ? 255 : 174, on ? 255 : 178);
+    icons_draw(texture, r.x + r.w * 0.5f, r.y + r.h * 0.5f, 18.0f);
+    if (texture) SDL_SetTextureColorMod(texture, 255, 255, 255);
 }
 
 void draw_status_dot(float x, float y, bool on) {
     fill_round({x, y, 7, 7}, 3.5f, on ? 48 : 72, on ? 209 : 72, on ? 88 : 76);
 }
 
-void draw_left_card_chrome(float y, float h, Uint8 alpha) {
-    g_ui.callout_rect = {0, y, static_cast<float>(kCalloutWidth), h};
+void draw_left_card_chrome(float x, float y, float h, Uint8 alpha, bool tail = true) {
+    g_ui.callout_rect = {x, y, static_cast<float>(kCalloutWidth), h};
     aa_round_rect(g_ui.callout_rect, static_cast<float>(kCardRadius), color(18, 18, 20), color(18, 18, 20), 0, alpha);
+    if (!tail) return;
     float cy = y + h * 0.5f;
-    SDL_Color tail = color(18, 18, 20);
-    tail.a = alpha;
-    filled_polygon({
-        {static_cast<float>(kCalloutWidth) - 2.0f, cy - 8.0f},
-        {static_cast<float>(kCalloutWidth) - 2.0f, cy + 8.0f},
-        {static_cast<float>(kCalloutWidth + kTailWidth), cy}
-    }, tail);
+    SDL_Color tcol = color(18, 18, 20);
+    tcol.a = alpha;
+    float dock_cx = g_ui.dock_ox + static_cast<float>(kDockWidth) * 0.5f;
+    bool tail_right = dock_cx >= x + static_cast<float>(kCalloutWidth) * 0.5f;
+    if (tail_right) {
+        filled_polygon({
+            {x + static_cast<float>(kCalloutWidth) - 2.0f, cy - 8.0f},
+            {x + static_cast<float>(kCalloutWidth) - 2.0f, cy + 8.0f},
+            {x + static_cast<float>(kCalloutWidth + kTailWidth), cy}
+        }, tcol);
+    } else {
+        filled_polygon({
+            {x + 2.0f, cy - 8.0f},
+            {x + 2.0f, cy + 8.0f},
+            {x - static_cast<float>(kTailWidth), cy}
+        }, tcol);
+    }
 }
 
 void draw_input_field(Rect box, const std::string& masked, bool focused) {
@@ -1363,14 +1589,15 @@ void draw_panel() {
     }
     int visible = 0;
     int visible_index[kProviderCount];
-    for (int i = 0; i < kProviderCount; ++i) if (enabled[i]) visible_index[visible++] = i;
+    visible = collect_visible(visible_index);
     if (visible == 0) {
         visible_index[0] = selected;
         visible = 1;
     }
     float dx = dock_x();
+    float dy = g_ui.dock_oy;
     float dock_h = static_cast<float>(std::max(kDockPad + visible * kRingSlot + kDockFooter, kCalloutHeight));
-    g_ui.dock_rect = {dx, 0, static_cast<float>(kDockWidth), dock_h};
+    g_ui.dock_rect = {dx, dy, static_cast<float>(kDockWidth), dock_h};
     g_ui.callout_pin_button = {};
     g_ui.settings_fill_toggle = {};
     for (int i = 0; i < kProviderCount; ++i) {
@@ -1381,7 +1608,7 @@ void draw_panel() {
     for (int slot = 0; slot < kProviderCount; ++slot) g_ui.ring_slots[slot] = {};
     for (int n = 0; n < visible; ++n) {
         int i = visible_index[n];
-        float cy = static_cast<float>(kDockPad + n * kRingSlot + kRingSize * 0.5f);
+        float cy = dy + static_cast<float>(kDockPad + n * kRingSlot + kRingSize * 0.5f);
         float cx = dx + kDockWidth * 0.5f;
         g_ui.ring_slots[i] = {dx + 6, cy - 30, static_cast<float>(kDockWidth) - 12, 68};
         float pop = 1.0f + 0.08f * g_ui.hover_anim[i];
@@ -1398,90 +1625,118 @@ void draw_panel() {
         auto [tw, th] = measure_text(pct, false, true);
         text(cx - tw * 0.5f, cy + 26.0f, pct, 245, 245, 247, false, true);
     }
-    float footer_y = static_cast<float>(kDockPad + visible * kRingSlot + 2);
+    float footer_y = dy + static_cast<float>(kDockPad + visible * kRingSlot + 2);
     g_ui.gear_button = {dx + 8, footer_y, 36, 36};
     g_ui.pin_button = {dx + 48, footer_y, 36, 36};
     draw_gear_icon(g_ui.gear_button, g_ui.gear_hot);
-    draw_pin_icon(g_ui.pin_button, g_ui.pinned, g_ui.pin_hot);
-    bool left_open = g_ui.callout_open || left_sheet_open();
+    draw_pin_icon(g_ui.pin_button, g_ui.pinned || any_model_pinned_open(), g_ui.pin_hot);
+    bool left_open = left_sheet_open();
+    for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_anim[i] > 0.02f) left_open = true;
     if (left_open && g_ui.left_anim > 0.02f) {
         Uint8 alpha = static_cast<Uint8>(std::clamp(g_ui.left_anim, 0.0f, 1.0f) * 255.0f);
-        auto draw_model_card = [&](int index, float card_y) {
+        auto draw_model_card = [&](int index, float card_x, float card_y) {
             const auto& state = states[index];
             float card_h = static_cast<float>(kCalloutHeight);
-            draw_left_card_chrome(card_y, card_h, alpha);
+            Uint8 card_a = static_cast<Uint8>(std::clamp(g_ui.model_anim[index], 0.0f, 1.0f) * static_cast<float>(alpha));
+            draw_left_card_chrome(card_x, card_y, card_h, card_a, !g_ui.model_detached[index]);
             g_ui.model_callout_rect[index] = g_ui.callout_rect;
-            draw_provider_glyph(28, card_y + 26, index, provider_accent(index));
-            text(44, card_y + 16, provider_label(index), 245, 245, 247, true);
-            g_ui.model_pin_button[index] = {static_cast<float>(kCalloutWidth) - 58, card_y + 10, 28, 28};
+            draw_provider_glyph(card_x + 28, card_y + 26, index, provider_accent(index));
+            std::string title = provider_label(index);
+            if (acct_of(index) > 0) title += " " + std::to_string(acct_of(index) + 1);
+            text(card_x + 44, card_y + 16, title, 245, 245, 247, true);
+            g_ui.model_pin_button[index] = {card_x + static_cast<float>(kCalloutWidth) - 58, card_y + 10, 28, 28};
             if (index == selected) g_ui.callout_pin_button = g_ui.model_pin_button[index];
             draw_pin_icon(g_ui.model_pin_button[index], g_ui.model_pinned[index], g_ui.model_pinned[index] ? 1.0f : 0.0f);
-            draw_status_dot(static_cast<float>(kCalloutWidth) - 24, card_y + 20, state.logged_in && !state.busy);
+            draw_status_dot(card_x + static_cast<float>(kCalloutWidth) - 24, card_y + 20, state.logged_in && !state.busy);
             auto row = [&](float y, const std::string& label, bool available, double used, long long reset, bool weekly) {
                 if (!available) return;
-                text(18, y, label, 245, 245, 247, false, true);
+                text(card_x + 18, y, label, 245, 245, 247, false, true);
                 std::string reset_text = format_reset_phrase(reset);
                 auto [rw, rh] = measure_text(reset_text, false, true);
-                text(static_cast<float>(kCalloutWidth) - 18 - rw, y, reset_text, 142, 142, 147, false, true);
-                usage_track(18, y + 20, static_cast<float>(kCalloutWidth) - 36, used, weekly);
-                text(18, y + 30, std::to_string(static_cast<int>(std::round(display_percent(used)))) + (g_ui.show_remaining ? "% Left" : "% Used"), 174, 174, 178, false, true);
+                text(card_x + static_cast<float>(kCalloutWidth) - 18 - rw, y, reset_text, 142, 142, 147, false, true);
+                usage_track(card_x + 18, y + 20, static_cast<float>(kCalloutWidth) - 36, used, weekly);
+                text(card_x + 18, y + 30, std::to_string(static_cast<int>(std::round(display_percent(used)))) + (g_ui.show_remaining ? "% Left" : "% Used"), 174, 174, 178, false, true);
             };
             float y = card_y + 48;
             if (state.primary_available) { row(y, state.primary_row, true, state.primary_used, state.primary_reset, false); y += 56; }
             if (state.secondary_available) row(y, state.secondary_row, true, state.secondary_used, state.secondary_reset, true);
         };
         if (left_sheet_open()) {
-            float card_y = 0, card_h = 0;
+            float card_x = snap_callout_x();
+            float card_y = g_ui.dock_oy, card_h = 0;
             left_card_geom(&card_y, &card_h);
-            draw_left_card_chrome(card_y, card_h, alpha);
+            card_y = g_ui.dock_oy;
+            draw_left_card_chrome(card_x, card_y, card_h, alpha);
             if (g_ui.api_key_mode) {
-                text(18, card_y + 16, "GLM API key", 245, 245, 247, true);
-                text(18, card_y + 40, "Paste key. Saved in the platform secret store.", 142, 142, 147, false, true);
-                g_ui.api_input = {18, card_y + 68, 300, 32};
+                text(card_x + 18, card_y + 16, "GLM API key", 245, 245, 247, true);
+                text(card_x + 18, card_y + 40, "Paste key. Saved in the platform secret store.", 142, 142, 147, false, true);
+                g_ui.api_input = {card_x + 18, card_y + 68, 300, 32};
                 draw_input_field(g_ui.api_input, masked_input_text(g_ui.api_key_input, 280), g_ui.api_input_focused);
-                g_ui.api_ok = {18, card_y + 112, 144, 30};
-                g_ui.api_cancel = {174, card_y + 112, 144, 30};
+                g_ui.api_ok = {card_x + 18, card_y + 112, 144, 30};
+                g_ui.api_cancel = {card_x + 174, card_y + 112, 144, 30};
                 button(g_ui.api_ok, "Save", !g_ui.api_key_input.empty());
                 button(g_ui.api_cancel, "Cancel", true);
             } else if (g_ui.oauth_code_mode) {
-                bool grok = g_ui.oauth_session.provider == "grok";
-                text(18, card_y + 16, grok ? "Grok verification" : "Gemini verification", 245, 245, 247, true);
-                text(18, card_y + 40, grok ? "Paste the code from the browser." : "Paste the code shown by Antigravity.", 142, 142, 147, false, true);
-                g_ui.oauth_code_input_box = {18, card_y + 68, 300, 32};
+                bool grok = oauth_provider_kind(g_ui.oauth_session.provider) == "grok";
+                text(card_x + 18, card_y + 16, grok ? "Grok verification" : "Gemini verification", 245, 245, 247, true);
+                text(card_x + 18, card_y + 40, grok ? "Paste the code from the browser." : "Paste the code shown by Antigravity.", 142, 142, 147, false, true);
+                g_ui.oauth_code_input_box = {card_x + 18, card_y + 68, 300, 32};
                 draw_input_field(g_ui.oauth_code_input_box, masked_input_text(g_ui.oauth_code_input, 280), g_ui.oauth_code_input_focused);
-                g_ui.oauth_code_ok = {18, card_y + 112, 144, 30};
-                g_ui.oauth_code_cancel = {174, card_y + 112, 144, 30};
+                g_ui.oauth_code_ok = {card_x + 18, card_y + 112, 144, 30};
+                g_ui.oauth_code_cancel = {card_x + 174, card_y + 112, 144, 30};
                 button(g_ui.oauth_code_ok, "Verify", !g_ui.oauth_code_input.empty());
                 button(g_ui.oauth_code_cancel, "Cancel", true);
             } else if (g_ui.settings_open) {
-                text(18, card_y + 16, "Settings", 245, 245, 247, true);
-                for (int i = 0; i < kProviderCount; ++i) {
-                    float y = card_y + static_cast<float>(kSettingsHeader + i * kSettingsRowHeight);
-                    SDL_Color accent = provider_accent(i);
-                    draw_provider_glyph(32, y + 22, i, accent);
-                    text(48, y + 8, provider_label(i), 245, 245, 247, true, true);
-                    text(48, y + 26, states[i].logged_in ? (states[i].account_label.empty() ? "Connected" : clip_text(states[i].account_label, 140, false, true)) : "Not signed in", 142, 142, 147, false, true);
-                    g_ui.settings_toggle[i] = {210, y + 12, 36, 22};
-                    aa_round_rect(g_ui.settings_toggle[i], 11, enabled[i] ? color(48, 209, 88) : color(58, 58, 62), enabled[i] ? color(48, 209, 88) : color(58, 58, 62));
-                    fill_round({g_ui.settings_toggle[i].x + (enabled[i] ? 18.0f : 4.0f), y + 15, 16, 16}, 8, 245, 245, 247);
-                    g_ui.settings_action[i] = {252, y + 12, 68, 24};
-                    button(g_ui.settings_action[i], states[i].logged_in ? "Sign out" : (i == 2 ? "Key" : "Sign in"), !states[i].busy);
-                }
-                float fill_y = card_y + static_cast<float>(kSettingsHeader + kProviderCount * kSettingsRowHeight);
-                text(18, fill_y + 8, g_ui.show_remaining ? "Show remaining" : "Show used", 245, 245, 247, true, true);
-                g_ui.settings_fill_toggle = {210, fill_y + 12, 36, 22};
+                text(card_x + 18, card_y + 16, "Settings", 245, 245, 247, true);
+                for (int i = 0; i < kKindCount; ++i) { g_ui.settings_add[i] = {}; g_ui.settings_add_kind[i] = {}; }
+                for (int i = 0; i < kProviderCount; ++i) g_ui.settings_remove[i] = {};
+                int row_i = 0;
+                auto draw_settings_row = [&](int slot, bool add) {
+                    float y = card_y + static_cast<float>(kSettingsHeader + row_i * kSettingsRowHeight);
+                    SDL_Color accent = provider_accent(slot);
+                    draw_provider_glyph(card_x + 32, y + 22, slot, accent);
+                    std::string title = provider_label(slot);
+                    if (acct_of(slot) > 0) title += " " + std::to_string(acct_of(slot) + 1);
+                    text(card_x + 48, y + 8, title, 245, 245, 247, true, true);
+                    text(card_x + 48, y + 26, states[slot].logged_in ? (states[slot].account_label.empty() ? "Connected" : clip_text(states[slot].account_label, 110, false, true)) : "Not signed in", 142, 142, 147, false, true);
+                    g_ui.settings_toggle[slot] = {};
+                    g_ui.settings_action[slot] = {card_x + 188, y + 12, 48, 24};
+                    button(g_ui.settings_action[slot], states[slot].logged_in ? "Out" : (kind_of(slot) == 2 ? "Key" : "In"), !states[slot].busy);
+                    if (add && states[slot].logged_in) {
+                        g_ui.settings_add[kind_of(slot)] = {card_x + 240, y + 12, 26, 24};
+                        button(g_ui.settings_add[kind_of(slot)], "+", true);
+                    }
+                    g_ui.settings_remove[slot] = {card_x + 270, y + 12, 26, 24};
+                    button(g_ui.settings_remove[slot], "x", true);
+                    ++row_i;
+                };
+                for (int i = 0; i < kKindCount; ++i) if (g_app.listed[i]) draw_settings_row(i, true);
+                for (int i = kKindCount; i < kMaxSlots; ++i) if (kind_of(i) >= 0) draw_settings_row(i, false);
+                float fill_y = card_y + static_cast<float>(kSettingsHeader + row_i * kSettingsRowHeight);
+                text(card_x + 18, fill_y + 8, g_ui.show_remaining ? "Show remaining" : "Show used", 245, 245, 247, true, true);
+                g_ui.settings_fill_toggle = {card_x + 210, fill_y + 12, 36, 22};
                 aa_round_rect(g_ui.settings_fill_toggle, 11, g_ui.show_remaining ? color(48, 209, 88) : color(58, 58, 62), g_ui.show_remaining ? color(48, 209, 88) : color(58, 58, 62));
                 fill_round({g_ui.settings_fill_toggle.x + (g_ui.show_remaining ? 18.0f : 4.0f), fill_y + 15, 16, 16}, 8, 245, 245, 247);
-                g_ui.settings_refresh = {18, card_y + card_h - 42, 150, 28};
-                g_ui.settings_quit = {178, card_y + card_h - 42, 140, 28};
+                float add_y = fill_y + 40;
+                int hidden_n = 0;
+                for (int k = 0; k < kKindCount; ++k) {
+                    if (g_app.listed[k]) continue;
+                    if (hidden_n == 0) text(card_x + 18, add_y + 8, "Add model", 245, 245, 247, true, true);
+                    g_ui.settings_add_kind[k] = {card_x + 110 + static_cast<float>(hidden_n * 36), add_y + 4, 32, 32};
+                    aa_round_rect(g_ui.settings_add_kind[k], 8, color(36, 36, 38), color(58, 58, 62));
+                    draw_provider_glyph(g_ui.settings_add_kind[k].x + 16, g_ui.settings_add_kind[k].y + 16, k, provider_accent(k));
+                    ++hidden_n;
+                }
+                g_ui.settings_refresh = {card_x + 18, card_y + card_h - 42, 150, 28};
+                g_ui.settings_quit = {card_x + 178, card_y + card_h - 42, 140, 28};
                 button(g_ui.settings_refresh, "Refresh all", true);
                 button(g_ui.settings_quit, "Quit", true);
             }
         } else {
             for (int i = 0; i < kProviderCount; ++i) {
-                if (!g_ui.model_open[i]) continue;
+                if (g_ui.model_anim[i] < 0.02f) continue;
                 float card_y = (model_is_snapped(i) && i == selected) ? g_ui.card_y_anim : callout_y_for(i);
-                draw_model_card(i, card_y);
+                draw_model_card(i, callout_x_for(i), card_y);
             }
         }
     }
@@ -1548,7 +1803,13 @@ void save_layout() {
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         json += "\"selected\":" + std::to_string(g_app.selected);
-        for (int i = 0; i < kProviderCount; ++i) json += ",\"e" + std::to_string(i) + "\":" + (g_app.enabled[i] ? "1" : "0");
+        for (int i = 0; i < kKindCount; ++i) json += ",\"l" + std::to_string(i) + "\":" + (g_app.listed[i] ? "1" : "0");
+        for (int i = 0; i < kProviderCount; ++i) {
+            json += ",\"e" + std::to_string(i) + "\":" + (g_app.enabled[i] ? "1" : "0");
+            json += ",\"sk" + std::to_string(i) + "\":" + std::to_string(g_app.slot_kind[i]);
+            json += ",\"sa" + std::to_string(i) + "\":" + std::to_string(g_app.slot_acct[i]);
+            json += ",\"o" + std::to_string(i) + "\":" + std::to_string(g_app.dock_order[i]);
+        }
     }
     json += ",\"remain\":" + std::string(g_ui.show_remaining ? "1" : "0");
     json += "}";
@@ -1556,7 +1817,7 @@ void save_layout() {
 }
 
 void logout_provider(int index) {
-    clear_credentials_provider(provider_key(index));
+    clear_credentials_provider(store_key(index));
     std::lock_guard<std::mutex> lock(g_app.mutex);
     auto& state = g_app.providers[index];
     ++state.operation_id;
@@ -1570,6 +1831,34 @@ void logout_provider(int index) {
     state.primary_reset = 0;
     state.secondary_reset = 0;
     state.last_refresh_ms = 0;
+    if (index >= kKindCount) {
+        g_app.slot_kind[index] = -1;
+        g_app.enabled[index] = false;
+    }
+}
+
+int alloc_slot(int kind, int acct = -1) {
+    if (kind < 0 || kind >= kKindCount) return -1;
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        if (acct < 0) {
+            acct = 1;
+            for (int i = 0; i < kMaxSlots; ++i) if (g_app.slot_kind[i] == kind) acct = std::max(acct, g_app.slot_acct[i] + 1);
+        }
+        for (int i = kKindCount; i < kMaxSlots; ++i) {
+            if (g_app.slot_kind[i] >= 0) continue;
+            g_app.slot_kind[i] = kind;
+            g_app.slot_acct[i] = acct;
+            g_app.enabled[i] = true;
+            g_app.selected = i;
+            auto& state = g_app.providers[i];
+            state = ProviderState{};
+            state.primary_row = primary_row_label(i);
+            state.secondary_row = secondary_row_label(i);
+            return i;
+        }
+    }
+    return -1;
 }
 
 void toggle_model_pin(int index) {
@@ -1577,18 +1866,18 @@ void toggle_model_pin(int index) {
     g_ui.model_pinned[index] = !g_ui.model_pinned[index];
     if (g_ui.model_pinned[index]) {
         g_ui.model_detached[index] = true;
-        g_ui.model_callout_y[index] = g_ui.model_callout_rect[index].w > 0 ? g_ui.model_callout_rect[index].y : callout_y_for(index);
+        g_ui.model_off_x[index] = callout_x_for(index) - g_ui.dock_ox;
+        g_ui.model_off_y[index] = callout_y_for(index) - g_ui.dock_oy;
     } else {
         for (int j = 0; j < kProviderCount; ++j) {
-            if (j != index && model_is_snapped(j)) {
-                g_ui.model_open[j] = false;
-                g_ui.model_detached[j] = false;
-            }
+            if (j != index && model_is_snapped(j)) g_ui.model_open[j] = false;
         }
         g_ui.model_detached[index] = false;
-        g_ui.model_callout_y[index] = -1;
+        g_ui.model_off_x[index] = snap_off_x();
+        g_ui.model_off_y[index] = snap_off_y(index);
     }
     sync_callout_open();
+    apply_layout();
 }
 
 void toggle_model_callout(int index) {
@@ -1597,28 +1886,28 @@ void toggle_model_callout(int index) {
         g_app.selected = index;
     }
     g_ui.settings_open = false;
-    if (model_is_snapped(index)) {
+    if (g_ui.model_open[index]) {
         g_ui.model_open[index] = false;
+        g_ui.model_pinned[index] = false;
         g_ui.model_detached[index] = false;
         sync_callout_open();
+        apply_layout();
         return;
     }
-    if (g_ui.model_open[index]) return;
     for (int j = 0; j < kProviderCount; ++j) {
-        if (j != index && model_is_snapped(j)) {
-            g_ui.model_open[j] = false;
-            g_ui.model_detached[j] = false;
-        }
+        if (j != index && model_is_snapped(j)) g_ui.model_open[j] = false;
     }
     g_ui.model_open[index] = true;
     g_ui.model_detached[index] = false;
-    g_ui.model_callout_y[index] = -1;
+    g_ui.model_off_x[index] = snap_off_x();
+    g_ui.model_off_y[index] = snap_off_y(index);
     g_ui.callout_open = true;
+    apply_layout();
 }
 
 void handle_right_click(float, float) {
     g_ui.settings_open = !g_ui.settings_open;
-    set_target_height(wanted_panel_height());
+    apply_layout();
 }
 
 void handle_click(float x, float y) {
@@ -1637,16 +1926,13 @@ void handle_click(float x, float y) {
     }
     if (g_ui.gear_hovered) {
         g_ui.settings_open = !g_ui.settings_open;
-        set_target_height(wanted_panel_height());
-        update_window_shape();
+        apply_layout();
         return;
     }
     if (g_ui.hover_ring >= 0 && !g_ui.settings_open && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
         int i = g_ui.hover_ring;
         toggle_model_callout(i);
         if (provider_has_auth(i)) refresh_usage_async_for(i, false);
-        set_target_height(wanted_panel_height());
-        update_window_shape();
         return;
     }
     if (g_ui.api_key_mode) {
@@ -1676,13 +1962,41 @@ void handle_click(float x, float y) {
     }
     if (contains(g_ui.gear_button, x, y)) {
         g_ui.settings_open = !g_ui.settings_open;
-        set_target_height(wanted_panel_height());
+        apply_layout();
         return;
     }
     if (g_ui.settings_open) {
         if (contains(g_ui.settings_fill_toggle, x, y)) {
             g_ui.show_remaining = !g_ui.show_remaining;
             save_layout();
+            return;
+        }
+        for (int k = 0; k < kKindCount; ++k) {
+            if (contains(g_ui.settings_add_kind[k], x, y)) {
+                g_app.listed[k] = true;
+                g_app.enabled[k] = true;
+                save_layout();
+                apply_layout();
+                return;
+            }
+            if (!contains(g_ui.settings_add[k], x, y)) continue;
+            int slot = alloc_slot(k);
+            if (slot < 0) return;
+            save_layout();
+            apply_layout();
+            login_async_for(slot);
+            return;
+        }
+        for (int i = 0; i < kProviderCount; ++i) {
+            if (!contains(g_ui.settings_remove[i], x, y)) continue;
+            if (i >= kKindCount) logout_provider(i);
+            else {
+                g_app.listed[kind_of(i)] = false;
+                g_app.enabled[i] = false;
+                g_ui.model_open[i] = false;
+            }
+            save_layout();
+            apply_layout();
             return;
         }
         for (int i = 0; i < kProviderCount; ++i) {
@@ -1736,7 +2050,15 @@ void handle_click(float x, float y) {
 void handle_mouse_down(float x, float y) {
     g_ui.click_armed = false;
     g_ui.dragging_model = -1;
-    if (g_ui.hover_ring >= 0 || g_ui.gear_hovered || g_ui.pin_hovered || over_click_target(x, y)) {
+    g_ui.reorder_slot = -1;
+    g_ui.pending_ring = -1;
+    if (g_ui.hover_ring >= 0 && !g_ui.settings_open && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
+        g_ui.pending_ring = g_ui.hover_ring;
+        g_ui.press_x = x;
+        g_ui.press_y = y;
+        return;
+    }
+    if (g_ui.gear_hovered || g_ui.pin_hovered || over_click_target(x, y)) {
         handle_click(x, y);
         g_ui.click_armed = true;
         return;
@@ -1745,7 +2067,10 @@ void handle_mouse_down(float x, float y) {
         if (!g_ui.model_open[i] || !contains(g_ui.model_callout_rect[i], x, y)) continue;
         if (contains(g_ui.model_pin_button[i], x, y)) continue;
         g_ui.dragging_model = i;
-        g_ui.drag_offset_y = static_cast<int>(y - g_ui.model_callout_rect[i].y);
+        g_ui.grab_x = static_cast<int>(x - g_ui.model_callout_rect[i].x);
+        g_ui.grab_y = static_cast<int>(y - g_ui.model_callout_rect[i].y);
+        g_ui.model_off_x[i] = g_ui.model_callout_rect[i].x - g_ui.dock_ox;
+        g_ui.model_off_y[i] = g_ui.model_callout_rect[i].y - g_ui.dock_oy;
         return;
     }
     if (!contains(g_ui.dock_rect, x, y) && !left_sheet_open()) {
@@ -1765,34 +2090,83 @@ void handle_mouse_down(float x, float y) {
 }
 
 void handle_mouse_motion() {
+    float gx = 0, gy = 0, lx = 0, ly = 0;
+    SDL_GetGlobalMouseState(&gx, &gy);
+    int wx = 0, wy = 0;
+    SDL_GetWindowPosition(g_ui.window, &wx, &wy);
+    window_to_logical(gx - static_cast<float>(wx), gy - static_cast<float>(wy), &lx, &ly);
+    if (g_ui.pending_ring >= 0 || g_ui.reorder_slot >= 0) {
+        float dx = lx - g_ui.press_x;
+        float dy = ly - g_ui.press_y;
+        bool near_dock = lx >= g_ui.dock_ox - 12.0f && lx <= g_ui.dock_ox + static_cast<float>(kDockWidth) + 12.0f;
+        if (g_ui.reorder_slot >= 0 || (g_ui.pending_ring >= 0 && near_dock && std::abs(dy) > 10.0f && std::abs(dy) >= std::abs(dx))) {
+            int index = g_ui.reorder_slot >= 0 ? g_ui.reorder_slot : g_ui.pending_ring;
+            g_ui.pending_ring = -1;
+            g_ui.reorder_slot = index;
+            int over = slot_at_dock_y(ly);
+            if (over >= 0 && over != index) {
+                swap_dock_order(index, over);
+                save_layout();
+            }
+            return;
+        }
+        if (g_ui.pending_ring >= 0 && dx * dx + dy * dy > 576.0f && !near_dock) {
+            int index = g_ui.pending_ring;
+            g_ui.pending_ring = -1;
+            {
+                std::lock_guard<std::mutex> lock(g_app.mutex);
+                g_app.selected = index;
+            }
+            for (int j = 0; j < kProviderCount; ++j) {
+                if (j != index && model_is_snapped(j)) g_ui.model_open[j] = false;
+            }
+            float scale = std::max(0.01f, g_ui.panel_scale);
+            g_ui.model_open[index] = true;
+            g_ui.model_detached[index] = true;
+            g_ui.callout_open = true;
+            g_ui.grab_x = kCalloutWidth - 24;
+            g_ui.grab_y = 24;
+            g_ui.model_off_x[index] = (gx - static_cast<float>(g_ui.grab_x) * scale - static_cast<float>(g_ui.dock_anchor_x)) / scale;
+            g_ui.model_off_y[index] = (gy - static_cast<float>(g_ui.grab_y) * scale - static_cast<float>(g_ui.dock_anchor_y)) / scale;
+            g_ui.dragging_model = index;
+            if (provider_has_auth(index)) refresh_usage_async_for(index, false);
+            apply_layout();
+        }
+        return;
+    }
     if (g_ui.dragging_model >= 0) {
-        float gx = 0, gy = 0, lx = 0, ly = 0;
-        SDL_GetGlobalMouseState(&gx, &gy);
-        int wx = 0, wy = 0;
-        SDL_GetWindowPosition(g_ui.window, &wx, &wy);
-        window_to_logical(gx - static_cast<float>(wx), gy - static_cast<float>(wy), &lx, &ly);
         int index = g_ui.dragging_model;
-        float h = static_cast<float>(kCalloutHeight);
-        float y = std::clamp(ly - static_cast<float>(g_ui.drag_offset_y), 0.0f, std::max(0.0f, static_cast<float>(g_ui.panel_height) - h));
-        g_ui.model_callout_y[index] = y;
-        float snap = snap_callout_y(index);
-        if (std::abs(y - snap) > 18.0f) g_ui.model_detached[index] = true;
-        else if (!g_ui.model_pinned[index]) g_ui.model_detached[index] = false;
-        set_target_height(wanted_panel_height());
+        float scale = std::max(0.01f, g_ui.panel_scale);
+        g_ui.model_off_x[index] = (gx - static_cast<float>(g_ui.grab_x) * scale - static_cast<float>(g_ui.dock_anchor_x)) / scale;
+        g_ui.model_off_y[index] = (gy - static_cast<float>(g_ui.grab_y) * scale - static_cast<float>(g_ui.dock_anchor_y)) / scale;
+        float dx = g_ui.model_off_x[index] - snap_off_x();
+        float dy = g_ui.model_off_y[index] - snap_off_y(index);
+        if (dx * dx + dy * dy > 400.0f) g_ui.model_detached[index] = true;
         return;
     }
     if (!g_ui.dragging) return;
-    float gx = 0;
-    float gy = 0;
-    SDL_GetGlobalMouseState(&gx, &gy);
     int nx = static_cast<int>(gx) - g_ui.drag_offset_x;
     int ny = static_cast<int>(gy) - g_ui.drag_offset_y;
     SDL_SetWindowPosition(g_ui.window, nx, ny);
     g_ui.anchor_bottom = ny + panel_height_px();
+    capture_dock_anchor();
     g_ui.drag_moved = true;
 }
 
 void handle_mouse_up(float x, float y) {
+    if (g_ui.reorder_slot >= 0) {
+        g_ui.reorder_slot = -1;
+        g_ui.pending_ring = -1;
+        apply_layout();
+        return;
+    }
+    if (g_ui.pending_ring >= 0) {
+        int index = g_ui.pending_ring;
+        g_ui.pending_ring = -1;
+        toggle_model_callout(index);
+        if (provider_has_auth(index)) refresh_usage_async_for(index, false);
+        return;
+    }
     if (g_ui.click_armed) {
         g_ui.click_armed = false;
         g_ui.dragging = false;
@@ -1800,7 +2174,19 @@ void handle_mouse_up(float x, float y) {
         g_ui.drag_moved = false;
         return;
     }
-    g_ui.dragging_model = -1;
+    if (g_ui.dragging_model >= 0) {
+        int index = g_ui.dragging_model;
+        g_ui.dragging_model = -1;
+        float dx = g_ui.model_off_x[index] - snap_off_x();
+        float dy = g_ui.model_off_y[index] - snap_off_y(index);
+        if (!g_ui.model_pinned[index] && dx * dx + dy * dy <= 400.0f) {
+            g_ui.model_detached[index] = false;
+            g_ui.model_off_x[index] = snap_off_x();
+            g_ui.model_off_y[index] = snap_off_y(index);
+        }
+        apply_layout();
+        return;
+    }
     bool was_dragging = g_ui.dragging;
     bool moved = g_ui.drag_moved;
     g_ui.dragging = false;
@@ -1813,6 +2199,9 @@ void load_layout() {
     if (!raw) return;
     if (auto remain = json_number(*raw, "remain")) g_ui.show_remaining = *remain != 0;
     std::lock_guard<std::mutex> lock(g_app.mutex);
+    for (int i = 0; i < kKindCount; ++i) {
+        if (auto flag = json_number(*raw, "l" + std::to_string(i))) g_app.listed[i] = *flag != 0;
+    }
     if (auto selected = json_number(*raw, "selected")) {
         int value = static_cast<int>(*selected);
         if (value >= 0 && value < kProviderCount) g_app.selected = value;
@@ -1822,6 +2211,14 @@ void load_layout() {
         if (auto flag = json_number(*raw, "e" + std::to_string(i))) {
             g_app.enabled[i] = *flag != 0;
             any = true;
+        }
+        if (auto order = json_number(*raw, "o" + std::to_string(i))) {
+            int value = static_cast<int>(*order);
+            if (value >= 0 && value < kProviderCount) g_app.dock_order[i] = value;
+        }
+        if (i >= kKindCount) {
+            if (auto kind = json_number(*raw, "sk" + std::to_string(i))) g_app.slot_kind[i] = static_cast<int>(*kind);
+            if (auto acct = json_number(*raw, "sa" + std::to_string(i))) g_app.slot_acct[i] = static_cast<int>(*acct);
         }
     }
     if (!any) {
@@ -1835,14 +2232,25 @@ void load_layout() {
 
 void init_state() {
     load_layout();
+    for (int kind = 0; kind < kKindCount; ++kind) {
+        for (int acct = 1; acct <= 4; ++acct) {
+            std::string store = std::string(kind_key(kind)) + "_" + std::to_string(acct);
+            bool has = kind == 2 ? load_api_key_provider(store).has_value() : load_credentials_provider(store).has_value();
+            if (!has) continue;
+            bool exists = false;
+            for (int i = 0; i < kMaxSlots; ++i) if (kind_of(i) == kind && acct_of(i) == acct) exists = true;
+            if (!exists) alloc_slot(kind, acct);
+        }
+    }
     std::lock_guard<std::mutex> lock(g_app.mutex);
     for (int i = 0; i < kProviderCount; ++i) {
+        if (kind_of(i) < 0) continue;
         auto& state = g_app.providers[i];
         state.logged_in = provider_has_auth(i);
         state.status = state.logged_in ? "Ready to refresh " + std::string(provider_label(i)) : "Not logged in";
         state.primary_row = primary_row_label(i);
         state.secondary_row = secondary_row_label(i);
-        if (i == 2) {
+        if (kind_of(i) == 2) {
             state.status = state.logged_in ? "Ready to refresh GLM" : "No GLM API key saved";
             state.account = state.logged_in ? "GLM API key" : "";
             state.account_label = state.logged_in ? "GLM" : "";
@@ -1851,8 +2259,8 @@ void init_state() {
             state.account_label = provider_label(i);
         }
     }
-    if (!g_app.enabled[g_app.selected]) {
-        for (int i = 0; i < kProviderCount; ++i) if (g_app.enabled[i]) { g_app.selected = i; break; }
+    if (kind_of(g_app.selected) < 0 || !g_app.enabled[g_app.selected]) {
+        for (int i = 0; i < kProviderCount; ++i) if (kind_of(i) >= 0 && g_app.enabled[i]) { g_app.selected = i; break; }
     }
 }
 
@@ -1890,6 +2298,7 @@ int main(int argc, char** argv) {
     bool debug = false;
     for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--debug") debug = true;
     diagnostics_init(debug);
+    SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         return 1;
     }
@@ -1932,7 +2341,9 @@ int main(int argc, char** argv) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             float ex = 0, ey = 0;
-            if (event.type == SDL_EVENT_QUIT) g_quit = true;
+            if (event.type == SDL_EVENT_QUIT) {
+                if (g_ui.visible) hide_panel();
+            }
             else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
                 event_logical(event, &ex, &ey);
                 handle_mouse_down(ex, ey);
@@ -1998,22 +2409,9 @@ int main(int argc, char** argv) {
         if (g_refresh_requested.exchange(false)) refresh_usage_async_for(selected_provider(), true);
         if (g_warm_requested.exchange(false)) warm_async_for(selected_provider());
 
-        int wanted_height = wanted_panel_height();
-        if (g_ui.target_height != wanted_height) set_target_height(wanted_height);
-
-        if (g_ui.panel_height != g_ui.target_height) {
-            int delta = g_ui.target_height - g_ui.panel_height;
-            int step = std::max(8, static_cast<int>(std::ceil(std::abs(delta) * 0.38f)));
-            g_ui.panel_height += std::abs(delta) <= step ? delta : step * (delta > 0 ? 1 : -1);
-            SDL_SetWindowSize(g_ui.window, panel_width_px(), panel_height_px());
-            update_render_metrics();
-            if (g_ui.anchor_bottom > 0) {
-                int wx = 0;
-                int wy = 0;
-                SDL_GetWindowPosition(g_ui.window, &wx, &wy);
-                SDL_SetWindowPosition(g_ui.window, wx, g_ui.anchor_bottom - panel_height_px());
-            }
-            update_window_shape();
+        if (g_ui.visible && g_ui.dragging_model < 0 && g_ui.reorder_slot < 0 && g_ui.pending_ring < 0) {
+            int wanted_height = wanted_panel_height();
+            if (g_ui.target_height != wanted_height || g_ui.panel_height != g_ui.target_height) apply_layout();
         }
 
         if (now_ms() - last_poll > 5 * 60 * 1000) {
