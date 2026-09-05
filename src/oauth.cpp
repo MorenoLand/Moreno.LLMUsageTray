@@ -40,6 +40,12 @@ static constexpr const char* kGeminiCodeAssistUrls[] = {
     "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
 };
 
+static constexpr const char* kGrokClientId = "b1a00492-073a-47ea-816f-4c329264a828";
+static constexpr const char* kGrokAuthorizeUrl = "https://auth.x.ai/oauth2/authorize";
+static constexpr const char* kGrokTokenUrl = "https://auth.x.ai/oauth2/token";
+static constexpr const char* kGrokRedirectUri = "http://127.0.0.1:56121/callback";
+static constexpr const char* kGrokScope = "openid profile email offline_access grok-cli:access api:access";
+
 struct GeminiOAuthConfig {
     std::string client_id;
     std::string client_secret;
@@ -236,15 +242,43 @@ static std::string create_gemini_authorize_url(const std::string& client_id, con
     return url;
 }
 
-static std::string jwt_account_id(const std::string& access_token) {
+static std::string create_grok_authorize_url(const std::string& challenge, const std::string& state) {
+    std::string url = kGrokAuthorizeUrl;
+    url += "?response_type=code";
+    url += "&client_id=" + url_escape(kGrokClientId);
+    url += "&redirect_uri=" + url_escape(kGrokRedirectUri);
+    url += "&scope=" + url_escape(kGrokScope);
+    url += "&code_challenge=" + url_escape(challenge);
+    url += "&code_challenge_method=S256";
+    url += "&state=" + url_escape(state);
+    return url;
+}
+
+static std::string jwt_payload(const std::string& access_token) {
     std::size_t first = access_token.find('.');
     if (first == std::string::npos) return "";
     std::size_t second = access_token.find('.', first + 1);
     if (second == std::string::npos) return "";
     auto payload = base64url_decode(access_token.substr(first + 1, second - first - 1));
     if (payload.empty()) return "";
-    std::string decoded(payload.begin(), payload.end());
-    return json_string(decoded, "chatgpt_account_id").value_or("");
+    return std::string(payload.begin(), payload.end());
+}
+
+static std::string jwt_claim(const std::string& access_token, const std::string& key) {
+    std::string decoded = jwt_payload(access_token);
+    return decoded.empty() ? "" : json_string(decoded, key).value_or("");
+}
+
+static std::string jwt_account_id(const std::string& access_token) {
+    return jwt_claim(access_token, "chatgpt_account_id");
+}
+
+static std::string grok_account_id(const std::string& access_token) {
+    std::string email = jwt_claim(access_token, "email");
+    if (!email.empty()) return email;
+    email = jwt_claim(access_token, "preferred_username");
+    if (!email.empty()) return email;
+    return jwt_claim(access_token, "sub");
 }
 
 static OAuthCredentials exchange_code(const std::string& code, const std::string& verifier) {
@@ -324,6 +358,32 @@ static OAuthCredentials exchange_gemini_code(const std::string& code, const std:
     return credentials;
 }
 
+static OAuthCredentials exchange_grok_code(const std::string& code, const std::string& verifier) {
+    HttpResponse res = http_post_form(kGrokTokenUrl, {
+        {"grant_type", "authorization_code"},
+        {"client_id", kGrokClientId},
+        {"code", code},
+        {"code_verifier", verifier},
+        {"redirect_uri", kGrokRedirectUri},
+    });
+    diagnostics_log("grok token exchange status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()) + " error=" + json_string(res.body, "error").value_or("none"));
+    if (res.status < 200 || res.status >= 300) {
+        throw std::runtime_error("Grok token exchange failed: HTTP " + std::to_string(res.status));
+    }
+    std::string access = json_string(res.body, "access_token").value_or("");
+    std::string refresh = json_string(res.body, "refresh_token").value_or("");
+    double expires_in = json_number(res.body, "expires_in").value_or(0);
+    if (access.empty() || refresh.empty() || expires_in <= 0) {
+        throw std::runtime_error("Grok token response missing access_token, refresh_token, or expires_in");
+    }
+    OAuthCredentials credentials;
+    credentials.access = access;
+    credentials.refresh = refresh;
+    credentials.expires_ms = now_ms() + static_cast<long long>(expires_in * 1000.0);
+    credentials.account_id = grok_account_id(access);
+    return credentials;
+}
+
 std::string gemini_discover_project(const std::string& access_token) {
     const std::string bodies[] = {
         "{\"metadata\":{\"ideType\":\"ANTIGRAVITY\"}}",
@@ -359,16 +419,19 @@ OAuthCredentials oauth_login_browser_provider(const std::string& provider) {
     if (provider == "glm") {
         throw std::runtime_error("GLM OAuth is not configured yet");
     }
-    std::string verifier = base64url_encode(random_bytes(32));
+    std::string verifier = base64url_encode(random_bytes(provider == "grok" ? 96 : 32));
     std::string challenge = base64url_encode(sha256_bytes(verifier));
     std::string state = provider == "anthropic" ? verifier : base64url_encode(random_bytes(16));
     std::string url = provider == "anthropic"
         ? create_anthropic_authorize_url(challenge, state)
-        : create_authorize_url(challenge, state);
+        : (provider == "grok" ? create_grok_authorize_url(challenge, state) : create_authorize_url(challenge, state));
 
     auto code_future = std::async(std::launch::async, [provider, state] {
         if (provider == "anthropic") {
             return wait_for_oauth_code_on(53692, "/callback", state, "Claude");
+        }
+        if (provider == "grok") {
+            return wait_for_oauth_code_on(56121, "/callback", state, "Grok");
         }
         return wait_for_oauth_code_on(1455, "/auth/callback", state, "ChatGPT");
     });
@@ -377,7 +440,7 @@ OAuthCredentials oauth_login_browser_provider(const std::string& provider) {
     std::string code = code_future.get();
     OAuthCredentials credentials = provider == "anthropic"
         ? exchange_anthropic_code(code, verifier)
-        : exchange_code(code, verifier);
+        : (provider == "grok" ? exchange_grok_code(code, verifier) : exchange_code(code, verifier));
     save_credentials_provider(provider, credentials);
     return credentials;
 }
@@ -461,6 +524,29 @@ OAuthCredentials oauth_refresh_provider(const std::string& provider, const std::
         credentials.access = access;
         credentials.refresh = refresh;
         credentials.expires_ms = now_ms() + static_cast<long long>(expires_in * 1000.0);
+        save_credentials_provider(provider, credentials);
+        return credentials;
+    }
+    if (provider == "grok") {
+        HttpResponse res = http_post_form(kGrokTokenUrl, {
+            {"grant_type", "refresh_token"},
+            {"refresh_token", refresh_token},
+            {"client_id", kGrokClientId},
+        });
+        if (res.status < 200 || res.status >= 300) {
+            throw std::runtime_error("Grok token refresh failed: HTTP " + std::to_string(res.status));
+        }
+        std::string access = json_string(res.body, "access_token").value_or("");
+        std::string refresh = json_string(res.body, "refresh_token").value_or(refresh_token);
+        double expires_in = json_number(res.body, "expires_in").value_or(0);
+        if (access.empty() || refresh.empty() || expires_in <= 0) {
+            throw std::runtime_error("Grok refresh response missing fields");
+        }
+        OAuthCredentials credentials;
+        credentials.access = access;
+        credentials.refresh = refresh;
+        credentials.expires_ms = now_ms() + static_cast<long long>(expires_in * 1000.0);
+        credentials.account_id = grok_account_id(access);
         save_credentials_provider(provider, credentials);
         return credentials;
     }

@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <iomanip>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -43,6 +44,9 @@ static constexpr const char* kGlmQuotaUrl = "https://api.z.ai/api/monitor/usage/
 static constexpr const char* kGlmChatUrl = "https://api.z.ai/api/coding/paas/v4/chat/completions";
 static constexpr const char* kGeminiQuotaUrl = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 static constexpr const char* kGeminiQuotaSummaryUrl = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+static constexpr const char* kGrokBillingUrl = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+static constexpr const char* kGrokSettingsUrl = "https://cli-chat-proxy.grok.com/v1/settings";
+static constexpr const char* kGrokChatUrl = "https://cli-chat-proxy.grok.com/v1/chat/completions";
 
 static long long parse_iso_or_epoch_reset(const std::string& value) {
     if (value.empty()) return 0;
@@ -349,6 +353,86 @@ static std::string gemini_platform() {
 #endif
 }
 
+static std::map<std::string, std::string> grok_headers(const std::string& access) {
+    return {
+        {"Authorization", "Bearer " + access},
+        {"X-XAI-Token-Auth", "xai-grok-cli"},
+        {"Accept", "application/json"},
+    };
+}
+
+static std::string lower_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+static bool grok_product_is_cli(const std::string& product) {
+    std::string lower = lower_ascii(product);
+    return lower.find("build") != std::string::npos || lower == "cli";
+}
+
+static bool grok_product_is_bot(const std::string& product) {
+    std::string lower = lower_ascii(product);
+    return lower.find("chat") != std::string::npos || lower.find("bot") != std::string::npos;
+}
+
+static RateWindow grok_window(double used_percent, long long reset_at, long long window_seconds) {
+    RateWindow window;
+    window.available = true;
+    window.used_percent = used_percent;
+    window.reset_at = reset_at;
+    window.limit_window_seconds = window_seconds;
+    return window;
+}
+
+static std::string grok_array(const std::string& config, const std::string& body, const char* key) {
+    std::string value = array_for_key(config, key);
+    if (value.empty()) value = array_for_key(body, key);
+    return value;
+}
+
+static UsageInfo parse_grok_usage(const std::string& body, const std::string& plan, const std::string& email) {
+    std::string config = object_for_key(body, "config");
+    if (config.empty()) config = body;
+    std::string period = object_for_key(config, "currentPeriod");
+    if (period.empty()) period = object_for_key(body, "currentPeriod");
+    std::string end = json_string(period, "end").value_or(json_string(config, "billingPeriodEnd").value_or(json_string(body, "billingPeriodEnd").value_or("")));
+    long long reset_at = parse_iso_or_epoch_reset(end);
+    std::string period_type = json_string(period, "type").value_or(json_string(body, "period").value_or(""));
+    long long window_seconds = period_type.find("MONTH") != std::string::npos ? 30LL * 24 * 60 * 60 : 7LL * 24 * 60 * 60;
+    bool has_period = !period.empty() || !end.empty();
+    double overall = json_number(config, "creditUsagePercent").value_or(json_number(body, "creditUsagePercent").value_or(has_period ? 0.0 : -1.0));
+    std::string products = grok_array(config, body, "productUsage");
+    if (products.empty()) products = grok_array(config, body, "products");
+    bool cli_found = false;
+    bool bot_found = false;
+    double cli_used = 0;
+    double bot_used = 0;
+    for (const std::string& object : objects_in_array(products)) {
+        std::string product = json_string(object, "product").value_or("");
+        double used = json_number(object, "usagePercent").value_or(json_number(object, "usage_percent").value_or(0));
+        if (grok_product_is_cli(product)) {
+            cli_found = true;
+            cli_used = used;
+        } else if (grok_product_is_bot(product)) {
+            bot_found = true;
+            bot_used = used;
+        }
+    }
+    if (!cli_found && overall < 0) {
+        auto used = json_number(object_for_key(config, "used"), "val");
+        auto limit = json_number(object_for_key(config, "monthlyLimit"), "val");
+        if (used && limit && *limit > 0) overall = (*used / *limit) * 100.0;
+    }
+    if (!has_period && overall < 0 && products.empty()) throw std::runtime_error("Grok billing response contained no usage windows");
+    UsageInfo info;
+    info.email = email;
+    info.plan_type = plan.empty() ? "Grok" : plan;
+    info.primary = grok_window(cli_found ? cli_used : (overall >= 0 ? overall : 0), reset_at, window_seconds);
+    info.secondary = grok_window(bot_found ? bot_used : 0, reset_at, window_seconds);
+    return info;
+}
+
 UsageInfo fetch_usage_with_auth() {
     return fetch_usage_with_auth_provider("openai");
 }
@@ -391,6 +475,23 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
     }
     if (credentials_expired(*credentials)) {
         credentials = oauth_refresh_provider(provider, credentials->refresh);
+    }
+
+    if (provider == "grok") {
+        auto headers = grok_headers(credentials->access);
+        HttpResponse res = http_get(kGrokBillingUrl, headers);
+        diagnostics_log("grok billing status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()));
+        diagnostics_log_raw("grok billing raw_body", res.body);
+        if (res.status < 200 || res.status >= 300) {
+            throw std::runtime_error("Grok billing request failed: HTTP " + std::to_string(res.status));
+        }
+        std::string plan = "Grok";
+        HttpResponse settings = http_get(kGrokSettingsUrl, headers);
+        diagnostics_log("grok settings status=" + std::to_string(settings.status) + " body_length=" + std::to_string(settings.body.size()));
+        if (settings.status >= 200 && settings.status < 300) {
+            plan = json_string(settings.body, "subscription_tier_display").value_or(json_string(settings.body, "subscription_tier").value_or(plan));
+        }
+        return parse_grok_usage(res.body, plan, credentials->account_id);
     }
 
     if (provider == "gemini") {
@@ -481,6 +582,15 @@ void warm_provider(const std::string& provider) {
     if (!credentials) throw std::runtime_error("Not logged in");
     if (credentials_expired(*credentials)) {
         credentials = oauth_refresh_provider(provider, credentials->refresh);
+    }
+
+    if (provider == "grok") {
+        std::string body = R"({"model":"grok-build-0.1","max_tokens":1,"messages":[{"role":"user","content":"."}]})";
+        HttpResponse res = http_post_json(kGrokChatUrl, body, grok_headers(credentials->access));
+        if (res.status < 200 || res.status >= 300) {
+            throw std::runtime_error("Grok warm request failed: HTTP " + std::to_string(res.status));
+        }
+        return;
     }
 
     if (provider == "anthropic") {
