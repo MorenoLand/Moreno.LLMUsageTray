@@ -167,6 +167,7 @@ struct UiState {
     float model_off_x[kProviderCount]{};
     float model_off_y[kProviderCount]{};
     float model_anim[kProviderCount]{};
+    float slot_anim[kProviderCount]{};
     bool show_remaining = false;
     int oauth_slot = 3;
     int api_key_slot = 2;
@@ -199,11 +200,14 @@ struct UiState {
     float pin_hot = 0;
     float left_anim = 0;
     float card_y_anim = 0;
+    float draw_opacity = 1.0f;
     int hover_ring = -1;
     bool gear_hovered = false;
     bool pin_hovered = false;
     bool prev_global_down = false;
     bool click_armed = false;
+    bool settings_target = false;
+    float settings_anim = 0;
     bool drag_layout_ready = false;
     bool preserving_pinned_cards = false;
     float pinned_screen_x[kProviderCount]{};
@@ -284,18 +288,24 @@ int collect_visible(int* out) {
     int n = 0;
     bool enabled[kProviderCount]{};
     int order[kProviderCount]{};
+    int kinds[kProviderCount]{};
+    bool listed[kKindCount]{};
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         for (int i = 0; i < kProviderCount; ++i) {
             enabled[i] = g_app.enabled[i];
             order[i] = g_app.dock_order[i];
+            kinds[i] = g_app.slot_kind[i];
         }
+        for (int i = 0; i < kKindCount; ++i) listed[i] = g_app.listed[i];
     }
     for (int k = 0; k < kProviderCount; ++k) {
         int i = order[k];
         if (i < 0 || i >= kProviderCount) continue;
-        if (!enabled[i] || kind_of(i) < 0) continue;
-        if (!g_app.listed[kind_of(i)]) continue;
+        int kind = kinds[i];
+        bool fading = g_ui.slot_anim[i] > 0.02f;
+        if ((!enabled[i] && !fading) || kind < 0) continue;
+        if (!fading && i < kKindCount && !listed[kind]) continue;
         if (out) out[n] = i;
         ++n;
     }
@@ -421,6 +431,11 @@ int settings_height();
 
 bool left_sheet_open() {
     return g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode || g_ui.confirm_open;
+}
+
+void request_settings(bool open) {
+    g_ui.settings_target = open;
+    if (open) g_ui.settings_open = true;
 }
 
 void sync_callout_open() {
@@ -822,7 +837,7 @@ void apply_layout() {
 }
 
 void close_menus() {
-    g_ui.settings_open = false;
+    request_settings(false);
     g_ui.confirm_open = false;
     g_ui.confirm_index = -1;
     for (int i = 0; i < kProviderCount; ++i) {
@@ -841,6 +856,8 @@ void show_panel() {
     g_ui.visible = true;
     g_ui.shown_at_ms = now_ms();
     g_ui.settings_open = false;
+    g_ui.settings_target = false;
+    g_ui.settings_anim = 0;
     g_ui.confirm_open = false;
     g_ui.confirm_index = -1;
     g_ui.callout_open = false;
@@ -879,7 +896,7 @@ void show_panel() {
 void hide_panel() {
     if (g_ui.api_key_mode || g_ui.oauth_code_mode) return;
     if (g_ui.pinned || any_model_pinned_open()) {
-        g_ui.settings_open = false;
+        request_settings(false);
         for (int i = 0; i < kProviderCount; ++i) {
             if (g_ui.model_open[i] && !g_ui.model_pinned[i]) {
                 g_ui.model_open[i] = false;
@@ -892,7 +909,7 @@ void hide_panel() {
     }
     g_ui.visible = false;
     g_ui.callout_open = false;
-    g_ui.settings_open = false;
+    request_settings(false);
     for (int i = 0; i < kProviderCount; ++i) {
         g_ui.model_open[i] = false;
         g_ui.model_detached[i] = false;
@@ -924,16 +941,20 @@ void polish_native_window() {
 void tick_ui(float dt) {
     double used[kProviderCount]{};
     bool logged[kProviderCount]{};
+    bool shown[kProviderCount]{};
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         for (int i = 0; i < kProviderCount; ++i) {
             logged[i] = g_app.providers[i].logged_in;
             used[i] = logged[i] ? g_app.providers[i].primary_used : 0;
+            int kind = g_app.slot_kind[i];
+            shown[i] = g_app.enabled[i] && kind >= 0 && (i >= kKindCount || g_app.listed[kind]);
         }
     }
     for (int i = 0; i < kProviderCount; ++i) {
         g_ui.used_anim[i] = approach(g_ui.used_anim[i], static_cast<float>(used[i]), dt, 10.0f);
         g_ui.hover_anim[i] = approach(g_ui.hover_anim[i], g_ui.hover_ring == i ? 1.0f : 0.0f, dt, 16.0f);
+        g_ui.slot_anim[i] = approach(g_ui.slot_anim[i], shown[i] ? 1.0f : 0.0f, dt, 14.0f);
     }
     g_ui.gear_hot = approach(g_ui.gear_hot, g_ui.gear_hovered ? 1.0f : 0.0f, dt, 16.0f);
     g_ui.pin_hot = approach(g_ui.pin_hot, (g_ui.pin_hovered || g_ui.pinned || any_model_pinned_open()) ? 1.0f : 0.0f, dt, 16.0f);
@@ -965,6 +986,9 @@ void tick_ui(float dt) {
     bool left = left_sheet_open();
     for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_anim[i] > 0.02f) left = true;
     g_ui.left_anim = approach(g_ui.left_anim, left ? 1.0f : 0.0f, dt, 13.0f);
+    bool sheet_target = g_ui.settings_target || g_ui.api_key_mode || g_ui.oauth_code_mode || g_ui.confirm_open;
+    g_ui.settings_anim = approach(g_ui.settings_anim, sheet_target ? 1.0f : 0.0f, dt, 13.0f);
+    if (!sheet_target && g_ui.settings_open && g_ui.settings_anim < 0.02f) g_ui.settings_open = false;
     float target_y = 0, target_h = 0;
     left_card_geom(&target_y, &target_h);
     if (g_ui.left_anim < 0.05f) g_ui.card_y_anim = target_y;
@@ -1322,7 +1346,7 @@ void aa_round_rect(Rect r, float radius, SDL_Color fill_color, SDL_Color = SDL_C
     SDL_ClearSurface(surface, 0, 0, 0, 0);
     auto* pixels = static_cast<Uint32*>(surface->pixels);
     int stride = surface->pitch / static_cast<int>(sizeof(Uint32));
-    float a_scale = alpha / 255.0f;
+    float a_scale = alpha / 255.0f * std::clamp(g_ui.draw_opacity, 0.0f, 1.0f);
     for (int py = 0; py < sh; ++py) {
         for (int px = 0; px < sw; ++px) {
             float x = (static_cast<float>(px) + 0.5f) / scale;
@@ -1349,13 +1373,13 @@ void aa_round_rect(Rect r, float radius, SDL_Color fill_color, SDL_Color = SDL_C
 
 void fill(Rect r, Uint8 cr, Uint8 cg, Uint8 cb, Uint8 ca = 255) {
     SDL_FRect fr{r.x, r.y, r.w, r.h};
-    set_color(cr, cg, cb, ca);
+    set_color(cr, cg, cb, static_cast<Uint8>(ca * std::clamp(g_ui.draw_opacity, 0.0f, 1.0f)));
     SDL_RenderFillRect(g_ui.renderer, &fr);
 }
 
 void outline(Rect r, Uint8 cr, Uint8 cg, Uint8 cb) {
     SDL_FRect fr{r.x, r.y, r.w, r.h};
-    set_color(cr, cg, cb, 255);
+    set_color(cr, cg, cb, static_cast<Uint8>(255.0f * std::clamp(g_ui.draw_opacity, 0.0f, 1.0f)));
     SDL_RenderRect(g_ui.renderer, &fr);
 }
 
@@ -1419,7 +1443,7 @@ void text(float x, float y, const std::string& s, Uint8 r = 245, Uint8 g = 245, 
     if (s.empty()) return;
     TTF_Font* font = pick_font(bold, small);
     if (!font) return;
-    SDL_Surface* surface = TTF_RenderText_Blended(font, s.c_str(), s.size(), color(r, g, b));
+    SDL_Surface* surface = TTF_RenderText_Blended(font, s.c_str(), s.size(), color(r, g, b, static_cast<Uint8>(255.0f * std::clamp(g_ui.draw_opacity, 0.0f, 1.0f))));
     if (!surface) return;
     SDL_Texture* texture = SDL_CreateTextureFromSurface(g_ui.renderer, surface);
     if (texture) {
@@ -1480,7 +1504,7 @@ void thick_line(SDL_FPoint a, SDL_FPoint b, float width, SDL_Color c) {
     if (len <= 0.0f) return;
     float ox = -dy / len * width * 0.5f;
     float oy = dx / len * width * 0.5f;
-    SDL_FColor fc{c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f};
+    SDL_FColor fc{c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f * std::clamp(g_ui.draw_opacity, 0.0f, 1.0f)};
     SDL_Vertex verts[4] = {
         {{a.x + ox, a.y + oy}, fc, {0, 0}},
         {{a.x - ox, a.y - oy}, fc, {0, 0}},
@@ -1492,7 +1516,7 @@ void thick_line(SDL_FPoint a, SDL_FPoint b, float width, SDL_Color c) {
 }
 
 void filled_quad(SDL_FPoint a, SDL_FPoint b, SDL_FPoint c, SDL_FPoint d, SDL_Color col) {
-    SDL_FColor fc{col.r / 255.0f, col.g / 255.0f, col.b / 255.0f, col.a / 255.0f};
+    SDL_FColor fc{col.r / 255.0f, col.g / 255.0f, col.b / 255.0f, col.a / 255.0f * std::clamp(g_ui.draw_opacity, 0.0f, 1.0f)};
     SDL_Vertex verts[4] = {
         {a, fc, {0, 0}},
         {b, fc, {0, 0}},
@@ -1505,7 +1529,7 @@ void filled_quad(SDL_FPoint a, SDL_FPoint b, SDL_FPoint c, SDL_FPoint d, SDL_Col
 
 void filled_polygon(const std::vector<SDL_FPoint>& points, SDL_Color col) {
     if (points.size() < 3) return;
-    SDL_FColor fc{col.r / 255.0f, col.g / 255.0f, col.b / 255.0f, col.a / 255.0f};
+    SDL_FColor fc{col.r / 255.0f, col.g / 255.0f, col.b / 255.0f, col.a / 255.0f * std::clamp(g_ui.draw_opacity, 0.0f, 1.0f)};
     std::vector<SDL_Vertex> verts;
     std::vector<int> indices;
     verts.reserve(points.size());
@@ -1533,7 +1557,7 @@ void stroke_arc(float cx, float cy, float radius, float thickness, float t0, flo
     }
 }
 
-void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent) {
+void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent, float opacity = 1.0f) {
     const float thickness = 4.5f;
     const int scale = 3;
     int size = static_cast<int>(std::ceil((radius + thickness + 2.0f) * 2.0f * scale));
@@ -1558,7 +1582,7 @@ void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent) 
             if (ang < 0) ang += 6.2831853f;
             bool on_progress = sweep > 0.02f && ang <= sweep;
             SDL_Color c = on_progress ? accent : track;
-            float a = cover;
+            float a = cover * std::clamp(opacity, 0.0f, 1.0f);
             pixels[py * stride + px] = SDL_MapSurfaceRGBA(surface,
                 static_cast<Uint8>(c.r * a + 0.5f),
                 static_cast<Uint8>(c.g * a + 0.5f),
@@ -1577,9 +1601,12 @@ void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent) 
     SDL_DestroyTexture(texture);
 }
 
-void draw_provider_glyph(float cx, float cy, int index, SDL_Color) {
+void draw_provider_glyph(float cx, float cy, int index, SDL_Color, Uint8 alpha = 255) {
     int kind = kind_of(index);
-    icons_draw(icon_provider(kind < 0 ? 0 : kind), cx, cy, 18.0f);
+    SDL_Texture* texture = icon_provider(kind < 0 ? 0 : kind);
+    if (texture) SDL_SetTextureAlphaMod(texture, static_cast<Uint8>(alpha * std::clamp(g_ui.draw_opacity, 0.0f, 1.0f)));
+    icons_draw(texture, cx, cy, 18.0f);
+    if (texture) SDL_SetTextureAlphaMod(texture, 255);
 }
 
 void draw_gear_icon(Rect r, float = 0) {
@@ -1590,8 +1617,12 @@ void draw_pin_icon(Rect r, bool on, float = 0) {
     SDL_Texture* texture = icon_pin();
     if (on) fill_round({r.x + 4, r.y + 4, r.w - 8, r.h - 8}, 8, 48, 209, 88);
     if (texture) SDL_SetTextureColorMod(texture, on ? 255 : 174, on ? 255 : 174, on ? 255 : 178);
+    if (texture) SDL_SetTextureAlphaMod(texture, static_cast<Uint8>(255.0f * std::clamp(g_ui.draw_opacity, 0.0f, 1.0f)));
     icons_draw(texture, r.x + r.w * 0.5f, r.y + r.h * 0.5f, 18.0f);
-    if (texture) SDL_SetTextureColorMod(texture, 255, 255, 255);
+    if (texture) {
+        SDL_SetTextureColorMod(texture, 255, 255, 255);
+        SDL_SetTextureAlphaMod(texture, 255);
+    }
 }
 
 void draw_status_dot(float x, float y, bool on) {
@@ -1659,6 +1690,7 @@ void draw_model_card_content(int index, float card_x, float card_y, const Provid
 
 void draw_panel() {
     icons_set_renderer(g_ui.renderer);
+    g_ui.draw_opacity = 1.0f;
     set_color(0, 0, 0, 0);
     SDL_RenderClear(g_ui.renderer);
     int selected = 0;
@@ -1704,11 +1736,12 @@ void draw_panel() {
             accent.b = static_cast<Uint8>(std::min(255.0f, accent.b + 28 * g_ui.hover_anim[i]));
         }
         double used = display_percent(g_ui.used_anim[i]);
-        draw_ring(cx, cy, 23.0f * pop, used, accent);
-        draw_provider_glyph(cx, cy, i, accent);
+        float materialize = std::clamp(g_ui.slot_anim[i], 0.0f, 1.0f);
+        draw_ring(cx, cy, 23.0f * pop * (0.68f + 0.32f * materialize), used, accent, materialize);
+        draw_provider_glyph(cx, cy, i, accent, static_cast<Uint8>(materialize * 255.0f));
         std::string pct = states[i].logged_in ? (std::to_string(static_cast<int>(std::round(used))) + "%") : "--";
         auto [tw, th] = measure_text(pct, false, true);
-        text(cx - tw * 0.5f, cy + 26.0f, pct, 245, 245, 247, false, true);
+        text(cx - tw * 0.5f, cy + 26.0f, pct, static_cast<Uint8>(245.0f * materialize), static_cast<Uint8>(245.0f * materialize), static_cast<Uint8>(247.0f * materialize), false, true);
     }
     float footer_y = dy + static_cast<float>(kDockPad + visible * kRingSlot + 2);
     g_ui.gear_button = {dx + 8, footer_y, 36, 36};
@@ -1716,14 +1749,15 @@ void draw_panel() {
     draw_gear_icon(g_ui.gear_button, g_ui.gear_hot);
     draw_pin_icon(g_ui.pin_button, g_ui.pinned || any_model_pinned_open(), g_ui.pin_hot);
     bool left_open = left_sheet_open();
-    if (left_open && g_ui.left_anim > 0.02f) {
-        Uint8 alpha = static_cast<Uint8>(std::clamp(g_ui.left_anim, 0.0f, 1.0f) * 255.0f);
+    if (left_open && g_ui.settings_anim > 0.02f) {
+        Uint8 alpha = static_cast<Uint8>(std::clamp(g_ui.settings_anim, 0.0f, 1.0f) * 255.0f);
+        g_ui.draw_opacity = alpha / 255.0f;
         if (left_sheet_open()) {
             float card_x = snap_callout_x();
             float card_y = g_ui.dock_oy, card_h = 0;
             left_card_geom(&card_y, &card_h);
             card_y = g_ui.dock_oy;
-            draw_left_card_chrome(card_x, card_y, card_h, alpha);
+            draw_left_card_chrome(card_x, card_y, card_h, 255);
             if (g_ui.api_key_mode) {
                 text(card_x + 18, card_y + 16, "GLM API key", 245, 245, 247, true);
                 text(card_x + 18, card_y + 40, "Paste key. Saved in the platform secret store.", 142, 142, 147, false, true);
@@ -1813,6 +1847,7 @@ void draw_panel() {
             draw_model_card_content(i, callout_x_for(i), card_y, states[i], selected, card_alpha, !g_ui.model_detached[i]);
         }
     }
+    g_ui.draw_opacity = 1.0f;
     SDL_RenderPresent(g_ui.renderer);
 }
 
@@ -1933,7 +1968,9 @@ void draw_card_window(int index) {
     Rect previous_pin = g_ui.model_pin_button[index];
     Rect previous_callout_pin = g_ui.callout_pin_button;
     Rect previous_card = g_ui.callout_rect;
+    float previous_opacity = g_ui.draw_opacity;
     g_ui.renderer = g_ui.card_renderer[index];
+    g_ui.draw_opacity = 1.0f;
     icons_set_renderer(g_ui.renderer);
     int rw = 0, rh = 0;
     SDL_GetRenderOutputSize(g_ui.renderer, &rw, &rh);
@@ -1952,6 +1989,7 @@ void draw_card_window(int index) {
     g_ui.model_pin_button[index] = previous_pin;
     g_ui.callout_pin_button = previous_callout_pin;
     g_ui.callout_rect = previous_card;
+    g_ui.draw_opacity = previous_opacity;
     icons_set_renderer(g_ui.renderer);
 }
 
@@ -2052,6 +2090,8 @@ void create_tray() {
         SDL_TrayMenu* menu = SDL_CreateTrayMenu(g_ui.tray);
         SDL_TrayEntry* show = menu ? SDL_InsertTrayEntryAt(menu, -1, "Show", SDL_TRAYENTRY_BUTTON) : nullptr;
         if (show) SDL_SetTrayEntryCallback(show, on_tray_show, nullptr);
+        SDL_TrayEntry* refresh = menu ? SDL_InsertTrayEntryAt(menu, -1, "Refresh", SDL_TRAYENTRY_BUTTON) : nullptr;
+        if (refresh) SDL_SetTrayEntryCallback(refresh, on_tray_refresh, nullptr);
         SDL_TrayEntry* quit = menu ? SDL_InsertTrayEntryAt(menu, -1, "Quit", SDL_TRAYENTRY_BUTTON) : nullptr;
         if (quit) SDL_SetTrayEntryCallback(quit, on_tray_quit, nullptr);
     }
@@ -2180,7 +2220,7 @@ void toggle_model_callout(int index) {
 }
 
 void handle_right_click(float, float) {
-    g_ui.settings_open = !g_ui.settings_open;
+    request_settings(!g_ui.settings_target);
     apply_layout();
 }
 
@@ -2204,13 +2244,13 @@ void handle_click(float x, float y) {
         return;
     }
     if (g_ui.gear_hovered) {
-        g_ui.settings_open = !g_ui.settings_open;
+        request_settings(!g_ui.settings_target);
         apply_layout();
         return;
     }
     if (g_ui.hover_ring >= 0 && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
         int i = g_ui.hover_ring;
-        g_ui.settings_open = false;
+        request_settings(false);
         toggle_model_callout(i);
         if (provider_has_auth(i)) refresh_usage_async_for(i, false);
         return;
@@ -2241,7 +2281,7 @@ void handle_click(float x, float y) {
         return;
     }
     if (contains(g_ui.gear_button, x, y)) {
-        g_ui.settings_open = !g_ui.settings_open;
+        request_settings(!g_ui.settings_target);
         apply_layout();
         return;
     }
