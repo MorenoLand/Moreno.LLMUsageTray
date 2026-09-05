@@ -193,6 +193,7 @@ struct UiState {
     bool pin_hovered = false;
     bool prev_global_down = false;
     bool click_armed = false;
+    bool drag_layout_ready = false;
     SDL_BlendMode premul = SDL_BLENDMODE_BLEND;
 };
 
@@ -460,12 +461,6 @@ float callout_y_for(int index) {
     return snap_callout_y(index);
 }
 
-bool callout_outside_layout(int index) {
-    float x = callout_x_for(index);
-    float y = callout_y_for(index);
-    return x < -2.0f || y < -2.0f || x + static_cast<float>(kCalloutWidth) > static_cast<float>(layout_width()) + 2.0f || y + static_cast<float>(kCalloutHeight + 8) > static_cast<float>(g_ui.panel_height) + 2.0f;
-}
-
 void left_card_geom(float* y, float* h) {
     bool sheet = left_sheet_open();
     *h = sheet ? static_cast<float>(settings_height()) : static_cast<float>(kCalloutHeight);
@@ -651,7 +646,7 @@ void update_window_shape() {
     } else {
         int selected = selected_provider();
         for (int i = 0; i < kProviderCount; ++i) {
-            if (!g_ui.model_open[i] && g_ui.model_anim[i] < 0.02f) continue;
+            if (!g_ui.model_open[i]) continue;
             float card_y = model_is_snapped(i) && i == selected ? g_ui.card_y_anim : callout_y_for(i);
             add_card(callout_x_for(i), card_y, static_cast<float>(kCalloutHeight), !callout_floating(i));
         }
@@ -700,7 +695,7 @@ int wanted_panel_height() {
     if (g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode) return std::max(dock, settings_height() + static_cast<int>(std::ceil(g_ui.dock_oy)));
     int height = dock;
     for (int i = 0; i < kProviderCount; ++i) {
-        if (!g_ui.model_open[i] && g_ui.model_anim[i] < 0.02f) continue;
+        if (!g_ui.model_open[i]) continue;
         height = std::max(height, static_cast<int>(std::ceil(callout_y_for(i) + static_cast<float>(kCalloutHeight) + 8.0f)));
     }
     return height;
@@ -719,12 +714,14 @@ void set_target_height(int height, bool immediate = false) {
     g_ui.target_height = height;
     if (!immediate) {
         SDL_SetWindowSize(g_ui.window, panel_width_px(), panel_height_px());
+        SDL_SyncWindow(g_ui.window);
         update_render_metrics();
         int new_w = panel_width_px();
         if (g_ui.visible && new_w != old_w) {
             int wx = 0, wy = 0;
             SDL_GetWindowPosition(g_ui.window, &wx, &wy);
             SDL_SetWindowPosition(g_ui.window, wx + old_w - new_w, wy);
+            SDL_SyncWindow(g_ui.window);
         }
         update_window_shape();
         return;
@@ -733,10 +730,10 @@ void set_target_height(int height, bool immediate = false) {
     SDL_SetWindowSize(g_ui.window, panel_width_px(), panel_height_px());
     update_render_metrics();
     if (g_ui.anchor_bottom > 0) {
-        int wx = 0;
-        int wy = 0;
+        int wx = 0, wy = 0;
         SDL_GetWindowPosition(g_ui.window, &wx, &wy);
         SDL_SetWindowPosition(g_ui.window, wx, g_ui.anchor_bottom - panel_height_px());
+        SDL_SyncWindow(g_ui.window);
     }
     update_window_shape();
 }
@@ -768,12 +765,22 @@ void apply_layout() {
         include(dsx + static_cast<int>(std::lround(snap_off_x() * scale)), dsy, cw, ch);
     }
     for (int i = 0; i < kProviderCount; ++i) {
-        if (!g_ui.model_open[i] && g_ui.model_anim[i] < 0.02f) continue;
+        if (!g_ui.model_open[i]) continue;
         float ox = callout_floating(i) ? g_ui.model_off_x[i] : snap_off_x();
         float oy = callout_floating(i) ? g_ui.model_off_y[i] : snap_off_y(i);
         int cw = static_cast<int>(std::lround(static_cast<float>(kCalloutWidth + kTailWidth) * scale));
         int ch = static_cast<int>(std::lround(static_cast<float>(kCalloutHeight + 8) * scale));
         include(dsx + static_cast<int>(std::lround(ox * scale)), dsy + static_cast<int>(std::lround(oy * scale)), cw, ch);
+    }
+    if (g_ui.dragging_model >= 0) {
+        SDL_DisplayID display = SDL_GetDisplayForWindow(g_ui.window);
+        SDL_Rect bounds{};
+        if (display && SDL_GetDisplayBounds(display, &bounds)) {
+            left = std::min(left, bounds.x);
+            top = std::min(top, bounds.y);
+            right = std::max(right, bounds.x + bounds.w);
+            bottom = std::max(bottom, bounds.y + bounds.h);
+        }
     }
     bottom = std::max(bottom, dsy + dh);
     right = std::max(right, dsx + dw);
@@ -788,6 +795,7 @@ void apply_layout() {
     if (!g_ui.window) return;
     SDL_SetWindowSize(g_ui.window, panel_width_px(), panel_height_px());
     SDL_SetWindowPosition(g_ui.window, left, top);
+    SDL_SyncWindow(g_ui.window);
     g_ui.anchor_bottom = top + panel_height_px();
     update_render_metrics();
     update_window_shape();
@@ -1748,7 +1756,7 @@ void draw_panel() {
             }
         } else {
             for (int i = 0; i < kProviderCount; ++i) {
-                if (g_ui.model_anim[i] < 0.02f) continue;
+                if (!g_ui.model_open[i]) continue;
                 float card_y = (model_is_snapped(i) && i == selected) ? g_ui.card_y_anim : callout_y_for(i);
                 draw_model_card(i, callout_x_for(i), card_y);
             }
@@ -2064,6 +2072,7 @@ void handle_click(float x, float y) {
 void handle_mouse_down(float x, float y) {
     g_ui.click_armed = false;
     g_ui.dragging_model = -1;
+    g_ui.drag_layout_ready = false;
     g_ui.reorder_slot = -1;
     g_ui.pending_ring = -1;
     if (g_ui.hover_ring >= 0 && !g_ui.settings_open && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
@@ -2143,6 +2152,7 @@ void handle_mouse_motion() {
             g_ui.model_off_x[index] = (gx - static_cast<float>(g_ui.grab_x) * scale - static_cast<float>(g_ui.dock_anchor_x)) / scale;
             g_ui.model_off_y[index] = (gy - static_cast<float>(g_ui.grab_y) * scale - static_cast<float>(g_ui.dock_anchor_y)) / scale;
             g_ui.dragging_model = index;
+            g_ui.drag_layout_ready = true;
             if (provider_has_auth(index)) refresh_usage_async_for(index, false);
             apply_layout();
         }
@@ -2156,13 +2166,17 @@ void handle_mouse_motion() {
         float dx = g_ui.model_off_x[index] - snap_off_x();
         float dy = g_ui.model_off_y[index] - snap_off_y(index);
         if (dx * dx + dy * dy > 400.0f) g_ui.model_detached[index] = true;
-        if (callout_outside_layout(index)) apply_layout();
+        if (g_ui.model_detached[index] && !g_ui.drag_layout_ready) {
+            g_ui.drag_layout_ready = true;
+            apply_layout();
+        }
         return;
     }
     if (!g_ui.dragging) return;
     int nx = static_cast<int>(gx) - g_ui.drag_offset_x;
     int ny = static_cast<int>(gy) - g_ui.drag_offset_y;
     SDL_SetWindowPosition(g_ui.window, nx, ny);
+    SDL_SyncWindow(g_ui.window);
     g_ui.anchor_bottom = ny + panel_height_px();
     capture_dock_anchor();
     g_ui.drag_moved = true;
@@ -2186,6 +2200,7 @@ void handle_mouse_up(float x, float y) {
         g_ui.click_armed = false;
         g_ui.dragging = false;
         g_ui.dragging_model = -1;
+        g_ui.drag_layout_ready = false;
         g_ui.drag_moved = false;
         return;
     }
@@ -2314,6 +2329,10 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--debug") debug = true;
     diagnostics_init(debug);
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+#if defined(_WIN32)
+    SDL_SetHint(SDL_HINT_WINDOWS_ERASE_BACKGROUND_MODE, "never");
+    SDL_SetHint("SDL_WINDOW_RETAIN_CONTENT", "1");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         return 1;
     }
@@ -2374,7 +2393,7 @@ int main(int argc, char** argv) {
                 handle_mouse_up(ex, ey);
             } else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
 #if defined(__linux__)
-                if (now_ms() - g_ui.shown_at_ms > 250) hide_panel();
+                if (!g_ui.dragging && g_ui.dragging_model < 0 && g_ui.reorder_slot < 0 && g_ui.pending_ring < 0 && now_ms() - g_ui.shown_at_ms > 250) hide_panel();
 #endif
             }
             else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
