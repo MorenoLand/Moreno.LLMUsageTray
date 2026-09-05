@@ -11,6 +11,7 @@ provider's settings page.
 | Claude | Browser OAuth via Anthropic | 5 hour, weekly |
 | GLM/Z.ai | Saved API key | 5 hour quota, MCP/tool requests |
 | Gemini/Antigravity | Google OAuth with hosted verification code | 5 hour, weekly |
+| Grok | Browser OAuth via auth.x.ai (Grok CLI) | Weekly Grok CLI, weekly Grok Bot |
 
 ## Platform Status
 
@@ -23,8 +24,8 @@ Backend notes:
 
 ## Security
 
-The tray UI never prints access tokens. GPT, Claude, and Gemini use OAuth tokens;
-GLM stores only the API key you enter.
+The tray UI never prints access tokens. GPT, Claude, Gemini, and Grok use OAuth
+tokens; GLM stores only the API key you enter.
 
 ## Build
 
@@ -51,6 +52,12 @@ cmake --build build --config Release --target LLMUsageTray
 The executable is written to:
 
 ```text
+build\windows-release\Release\LLMUsageTray.exe
+```
+
+or, with a Visual Studio generator in `build`:
+
+```text
 build\Release\LLMUsageTray.exe
 ```
 
@@ -64,13 +71,13 @@ build/LLMUsageTray
 
 Run `LLMUsageTray.exe`. It starts in the system tray.
 
-The popup includes:
+The popup is a compact ring dock plus a detail card:
 
-- provider tabs for GPT, Claude, GLM, and Gemini; right-click a tab to swap its provider
-- progress bars with compact reset times
-- pin button to keep the popup open
-- drawer actions for login, refresh, warm, logout, and quit
-- draggable popup background
+- one ring per enabled provider, showing that provider's primary window as percent used
+- click a ring for the callout (session/CLI and weekly/Bot bars, reset times)
+- gear opens Settings to enable providers, sign in or out, and refresh
+- pin keeps the popup open; drag the cards to reposition
+- right-click the dock to toggle Settings
 
 GLM uses:
 
@@ -107,6 +114,15 @@ Gemini mirrors the Antigravity OAuth flow:
 - Quota reads AGY's local `RetrieveUserQuotaSummary` endpoint when AGY is running
 - Environment overrides are `LLM_USAGE_TRAY_GEMINI_CLIENT_ID` and
   `LLM_USAGE_TRAY_GEMINI_CLIENT_SECRET`; otherwise the installed AGY binary is inspected
+
+Grok uses the public Grok CLI OAuth client against `auth.x.ai`:
+
+- OAuth client id: `b1a00492-073a-47ea-816f-4c329264a828`
+- Callback: `http://127.0.0.1:56121/callback`
+- Token endpoint: `https://auth.x.ai/oauth2/token`
+- Usage endpoint: `https://cli-chat-proxy.grok.com/v1/billing?format=credits`
+- Usage headers include `X-XAI-Token-Auth: xai-grok-cli`
+- Bars are Grok CLI (`GrokBuild`) and Grok Bot (`GrokChat`) weekly product windows from that payload
 
 ## Debug
 

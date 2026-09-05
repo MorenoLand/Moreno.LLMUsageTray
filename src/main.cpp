@@ -14,24 +14,34 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <ctime>
 #include <filesystem>
 #include <mutex>
 #include <optional>
+#include <sstream>
+#include <iomanip>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace {
 
-constexpr int kPanelWidth = 300;
-constexpr int kPanelCollapsedHeight = 148;
-constexpr int kPanelApiKeyHeight = 188;
-constexpr int kPanelExpandedHeight = 282;
-constexpr int kUsageRowHeight = 44;
-constexpr int kProviderCount = 4;
-constexpr int kTabCount = 3;
-constexpr int kProviderMenuRowHeight = 24;
-constexpr int kProviderMenuWidth = 126;
+constexpr int kCalloutWidth = 336;
+constexpr int kDockWidth = 92;
+constexpr int kTailWidth = 10;
+constexpr int kCardGap = 8;
+constexpr int kPanelWidth = kCalloutWidth + kCardGap + kTailWidth + kDockWidth;
+constexpr int kDockPad = 14;
+constexpr int kRingSize = 52;
+constexpr int kRingSlot = 78;
+constexpr int kDockFooter = 56;
+constexpr int kCalloutHeight = 168;
+constexpr int kSettingsRowHeight = 52;
+constexpr int kSettingsHeader = 48;
+constexpr int kSettingsFooter = 56;
+constexpr int kProviderCount = 5;
+constexpr int kCardRadius = 20;
+constexpr int kDockRadius = 24;
 
 struct Rect {
     float x = 0;
@@ -47,25 +57,25 @@ struct ProviderState {
     std::string status = "Not logged in";
     std::string account;
     std::string account_label;
-    std::string primary = "5h: unknown";
-    std::string secondary = "Weekly: unknown";
-    std::string primary_row = "5 hour";
-    std::string secondary_row = "Weekly";
-    std::string tertiary = "Requests: unknown";
+    std::string primary_row = "Current session";
+    std::string secondary_row = "All models";
     std::string tertiary_row = "Requests";
     bool primary_available = true;
     bool secondary_available = true;
     bool tertiary_available = false;
-    double primary_left = 0;
-    double secondary_left = 0;
-    double tertiary_left = 0;
+    double primary_used = 0;
+    double secondary_used = 0;
+    double tertiary_used = 0;
+    long long primary_reset = 0;
+    long long secondary_reset = 0;
+    long long tertiary_reset = 0;
     long long last_refresh_ms = 0;
 };
 
 struct AppState {
     std::mutex mutex;
     ProviderState providers[kProviderCount];
-    int tab_providers[kTabCount] = {0, 1, 2};
+    bool enabled[kProviderCount] = {true, true, false, false, true};
     int selected = 0;
 };
 
@@ -76,6 +86,8 @@ struct UiState {
     SDL_Surface* icon = nullptr;
     TTF_Font* font = nullptr;
     TTF_Font* font_bold = nullptr;
+    TTF_Font* font_small = nullptr;
+    TTF_Font* font_small_bold = nullptr;
     std::filesystem::path font_path;
     std::filesystem::path font_bold_path;
     float panel_scale = 1.0f;
@@ -83,31 +95,32 @@ struct UiState {
     float font_scale = 0.0f;
     bool visible = false;
     bool pinned = false;
-    bool drawer_open = false;
+    bool callout_open = true;
+    bool settings_open = false;
     bool api_key_mode = false;
     bool api_input_focused = false;
     bool oauth_code_mode = false;
     bool oauth_code_input_focused = false;
-    bool provider_menu_open = false;
-    int provider_menu_tab = -1;
     bool dragging = false;
     bool drag_moved = false;
     int drag_offset_x = 0;
     int drag_offset_y = 0;
-    int panel_height = kPanelCollapsedHeight;
-    int target_height = kPanelCollapsedHeight;
+    int panel_height = 280;
+    int target_height = 280;
     int anchor_bottom = 0;
+    int anchor_right = 0;
     long long shown_at_ms = 0;
-    double drawer_anim = 0.0;
     std::string api_key_input;
     std::string oauth_code_input;
     OAuthLoginSession oauth_session;
-    Rect tabs[kTabCount];
-    Rect top_refresh_button, pin_button, drawer_button;
-    Rect login_button, refresh_button, warm_button, logout_button, quit_button;
+    Rect dock_rect, callout_rect;
+    Rect ring_slots[kProviderCount];
+    Rect pin_button, gear_button;
+    Rect settings_toggle[kProviderCount];
+    Rect settings_action[kProviderCount];
+    Rect settings_quit, settings_refresh;
     Rect api_input, api_ok, api_cancel;
     Rect oauth_code_input_box, oauth_code_ok, oauth_code_cancel;
-    Rect provider_menu_rect, provider_menu_options[kProviderCount];
 };
 
 AppState g_app;
@@ -135,45 +148,43 @@ long long now_ms() {
 }
 
 const char* provider_key(int index) {
+    if (index == 4) return "grok";
     if (index == 3) return "gemini";
     if (index == 2) return "glm";
     return index == 1 ? "anthropic" : "openai";
 }
 
 const char* provider_label(int index) {
+    if (index == 4) return "Grok";
     if (index == 3) return "Gemini";
     if (index == 2) return "GLM";
     return index == 1 ? "Claude" : "GPT";
 }
 
-const char* primary_label(int index) {
-    return index == 3 ? "Pro" : "5h";
-}
-
-const char* secondary_label(int index) {
-    return index == 3 ? "Flash" : "Weekly";
-}
-
 const char* primary_row_label(int index) {
-    return index == 3 ? "Pro" : "5 hour";
+    if (index == 4) return "Grok CLI";
+    if (index == 2) return "5 hour";
+    if (index == 3) return "5 hour";
+    return "Current session";
 }
 
 const char* secondary_row_label(int index) {
-    return index == 3 ? "Flash" : "Weekly";
+    if (index == 4) return "Grok Bot";
+    if (index == 2) return "Requests";
+    if (index == 3) return "Weekly";
+    return "All models";
 }
 
-std::string openai_row_label(const RateWindow& window, const char* fallback) {
-    if (window.limit_window_seconds >= 6 * 24 * 60 * 60) return "Weekly";
-    if (window.limit_window_seconds >= 4 * 60 * 60 && window.limit_window_seconds <= 6 * 60 * 60) return "5 hour";
-    return fallback;
+SDL_Color provider_accent(int index) {
+    if (index == 1) return SDL_Color{232, 114, 42, 255};
+    if (index == 2) return SDL_Color{45, 212, 191, 255};
+    if (index == 3) return SDL_Color{168, 139, 250, 255};
+    if (index == 4) return SDL_Color{236, 236, 239, 255};
+    return SDL_Color{232, 232, 234, 255};
 }
 
 bool provider_has_auth(int index) {
     return index == 2 ? load_api_key_provider("glm").has_value() : load_credentials_provider(provider_key(index)).has_value();
-}
-
-Rect& tab_rect(int index) {
-    return g_ui.tabs[std::clamp(index, 0, kTabCount - 1)];
 }
 
 std::string trim_copy(std::string value) {
@@ -194,33 +205,78 @@ std::string pretty_plan(std::string plan) {
     return plan;
 }
 
-bool status_visible(const std::string& status) {
-    return !status.empty() && status != "Updated" && status != "Logged out" && status != "Login complete" && status != "API key saved" && status.rfind("Ready to refresh ", 0) != 0 && status != "Not logged in";
-}
-
 bool contains(Rect r, float x, float y) {
     return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 }
 
-int tab_index_at(float x, float y) {
-    for (int i = 0; i < kTabCount; ++i) if (contains(tab_rect(i), x, y)) return i;
-    return -1;
+float dock_x() { return static_cast<float>(kCalloutWidth + kCardGap + kTailWidth); }
+
+int enabled_count() {
+    int n = 0;
+    for (int i = 0; i < kProviderCount; ++i) if (g_app.enabled[i]) ++n;
+    return n;
+}
+
+int dock_height() {
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        n = enabled_count();
+    }
+    if (n < 1) n = 1;
+    return kDockPad + n * kRingSlot + kDockFooter;
+}
+
+int settings_height() {
+    return kSettingsHeader + kProviderCount * kSettingsRowHeight + kSettingsFooter;
+}
+
+std::tm localtime_portable(std::time_t t) {
+    std::tm local{};
+#if defined(_WIN32)
+    localtime_s(&local, &t);
+#else
+    localtime_r(&t, &local);
+#endif
+    return local;
+}
+
+std::string format_reset_phrase(long long reset_at) {
+    if (reset_at <= 0) return "";
+    std::time_t now = static_cast<std::time_t>(now_ms() / 1000);
+    std::time_t reset = static_cast<std::time_t>(reset_at);
+    long long delta = static_cast<long long>(reset) - static_cast<long long>(now);
+    if (delta <= 0) return "Resetting";
+    if (delta < 2 * 3600) {
+        int minutes = static_cast<int>((delta + 59) / 60);
+        return "Resets in " + std::to_string(std::max(1, minutes)) + " min";
+    }
+    std::tm local = localtime_portable(reset);
+    std::ostringstream out;
+    out << "Resets " << std::put_time(&local, "%a, ");
+    if (local.tm_mday < 10) out << local.tm_mday;
+    else out << std::put_time(&local, "%d");
+    out << std::put_time(&local, " %b at %H:%M");
+    return out.str();
 }
 
 bool over_click_target(float x, float y) {
-    if (g_ui.provider_menu_open) return true;
     if (g_ui.api_key_mode) {
         return contains(g_ui.api_input, x, y) || contains(g_ui.api_ok, x, y) || contains(g_ui.api_cancel, x, y);
     }
     if (g_ui.oauth_code_mode) {
         return contains(g_ui.oauth_code_input_box, x, y) || contains(g_ui.oauth_code_ok, x, y) || contains(g_ui.oauth_code_cancel, x, y);
     }
-    if (tab_index_at(x, y) >= 0) return true;
-    if (contains(g_ui.top_refresh_button, x, y) || contains(g_ui.pin_button, x, y) || contains(g_ui.drawer_button, x, y)) return true;
-    if (!g_ui.drawer_open) return false;
-    return contains(g_ui.login_button, x, y) || contains(g_ui.refresh_button, x, y) ||
-        contains(g_ui.warm_button, x, y) || contains(g_ui.logout_button, x, y) ||
-        contains(g_ui.quit_button, x, y);
+    if (contains(g_ui.pin_button, x, y) || contains(g_ui.gear_button, x, y)) return true;
+    for (int i = 0; i < kProviderCount; ++i) if (contains(g_ui.ring_slots[i], x, y)) return true;
+    if (g_ui.settings_open) {
+        for (int i = 0; i < kProviderCount; ++i) {
+            if (contains(g_ui.settings_toggle[i], x, y) || contains(g_ui.settings_action[i], x, y)) return true;
+        }
+        return contains(g_ui.settings_quit, x, y) || contains(g_ui.settings_refresh, x, y) || contains(g_ui.callout_rect, x, y);
+    }
+    if (g_ui.callout_open && contains(g_ui.callout_rect, x, y)) return true;
+    return contains(g_ui.dock_rect, x, y);
 }
 
 SDL_HitTestResult SDLCALL hit_test(SDL_Window*, const SDL_Point* area, void*) {
@@ -261,33 +317,51 @@ void fill_surface_round_rect(SDL_Surface* surface, SDL_Rect rect, int radius, Ui
     }
 }
 
+int px(float value) { return static_cast<int>(std::round(value * g_ui.panel_scale)); }
+
 void update_window_shape() {
     int width = panel_width_px();
     int height = panel_height_px();
     SDL_Surface* shape = SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
     if (!shape) return;
     SDL_ClearSurface(shape, 0, 0, 0, 0);
-    fill_surface_round(shape, width, height, static_cast<int>(std::round(9 * g_ui.panel_scale)), SDL_MapSurfaceRGBA(shape, 255, 255, 255, 255));
+    Uint32 on = SDL_MapSurfaceRGBA(shape, 255, 255, 255, 255);
+    int radius = px(static_cast<float>(kDockRadius));
+    SDL_Rect dock{px(dock_x()), 0, px(static_cast<float>(kDockWidth)), px(static_cast<float>(dock_height()))};
+    fill_surface_round_rect(shape, dock, radius, on);
+    if (g_ui.callout_open || g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode) {
+        float card_h = g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode ? static_cast<float>(settings_height()) : static_cast<float>(kCalloutHeight);
+        float card_y = std::clamp(g_ui.callout_rect.y, 0.0f, static_cast<float>(g_ui.panel_height) - card_h);
+        SDL_Rect callout{0, px(card_y), px(static_cast<float>(kCalloutWidth)), px(card_h)};
+        fill_surface_round_rect(shape, callout, px(static_cast<float>(kCardRadius)), on);
+        int mid = px(card_y + card_h * 0.5f);
+        int tail_x = px(static_cast<float>(kCalloutWidth) - 2);
+        int tail_w = px(static_cast<float>(kTailWidth + kCardGap));
+        for (int x = 0; x < tail_w; ++x) {
+            int spread = std::max(1, px(8.0f) - x * px(8.0f) / std::max(1, tail_w));
+            SDL_Rect sliver{tail_x + x, mid - spread, 1, spread * 2};
+            fill_surface_rect(shape, sliver, on);
+        }
+    }
     SDL_SetWindowShape(g_ui.window, shape);
     SDL_DestroySurface(shape);
 }
 
 void close_fonts() {
-    if (g_ui.font_bold) {
-        TTF_CloseFont(g_ui.font_bold);
-        g_ui.font_bold = nullptr;
-    }
-    if (g_ui.font) {
-        TTF_CloseFont(g_ui.font);
-        g_ui.font = nullptr;
-    }
+    if (g_ui.font_small_bold) { TTF_CloseFont(g_ui.font_small_bold); g_ui.font_small_bold = nullptr; }
+    if (g_ui.font_small) { TTF_CloseFont(g_ui.font_small); g_ui.font_small = nullptr; }
+    if (g_ui.font_bold) { TTF_CloseFont(g_ui.font_bold); g_ui.font_bold = nullptr; }
+    if (g_ui.font) { TTF_CloseFont(g_ui.font); g_ui.font = nullptr; }
 }
 
 bool load_fonts_for_scale(float scale) {
     close_fonts();
-    float point_size = std::max(14.0f, std::round(14.0f * scale));
+    float point_size = std::max(15.0f, std::round(15.0f * scale));
+    float small_size = std::max(11.0f, std::round(11.0f * scale));
     g_ui.font = TTF_OpenFont(g_ui.font_path.string().c_str(), point_size);
     g_ui.font_bold = TTF_OpenFont(g_ui.font_bold_path.string().c_str(), point_size);
+    g_ui.font_small = TTF_OpenFont(g_ui.font_path.string().c_str(), small_size);
+    g_ui.font_small_bold = TTF_OpenFont(g_ui.font_bold_path.string().c_str(), small_size);
     g_ui.font_scale = scale;
     return g_ui.font != nullptr;
 }
@@ -308,14 +382,10 @@ void update_render_metrics(bool reload_fonts = true) {
 }
 
 int wanted_panel_height() {
-    if (g_ui.api_key_mode || g_ui.oauth_code_mode) return kPanelApiKeyHeight;
-    int rows;
-    {
-        std::lock_guard<std::mutex> lock(g_app.mutex);
-        const auto& state = g_app.providers[g_app.selected];
-        rows = static_cast<int>(state.primary_available) + static_cast<int>(state.secondary_available) + static_cast<int>(state.tertiary_available);
-    }
-    return (g_ui.drawer_open ? kPanelExpandedHeight : kPanelCollapsedHeight) + (rows - 2) * kUsageRowHeight;
+    int dock = dock_height();
+    if (g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode) return std::max(dock, settings_height());
+    if (g_ui.callout_open) return std::max(dock, kCalloutHeight + 8);
+    return dock;
 }
 
 void anchor_current_bottom() {
@@ -394,26 +464,29 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             } else if (provider_index == 3) {
                 state.account = info.email.empty() ? "Gemini" : info.email;
                 state.account_label = "Gemini";
+            } else if (provider_index == 4) {
+                state.account = info.email.empty() ? (plan.empty() || plan == "unknown" ? "Grok" : plan) : info.email + " (" + plan + ")";
+                state.account_label = plan.empty() || plan == "unknown" ? "Grok" : plan;
             } else {
                 state.account = info.email.empty() ? plan : info.email + " (" + plan + ")";
                 state.account_label = plan.empty() ? "GPT" : plan;
             }
-            state.primary = format_usage_line(primary_label(provider_index), info.primary);
-            state.secondary = format_usage_line(secondary_label(provider_index), info.secondary);
-            state.tertiary = format_usage_line("Requests", info.tertiary);
-            state.primary_row = provider_index == 3 ? "5 hour" : (provider_index == 0 ? openai_row_label(info.primary, primary_row_label(provider_index)) : primary_row_label(provider_index));
-            state.secondary_row = provider_index == 3 ? "Weekly" : (provider_index == 0 ? openai_row_label(info.secondary, secondary_row_label(provider_index)) : secondary_row_label(provider_index));
+            state.primary_row = primary_row_label(provider_index);
+            state.secondary_row = secondary_row_label(provider_index);
             state.tertiary_row = "Requests";
             state.primary_available = info.primary.available;
             state.secondary_available = info.secondary.available;
             state.tertiary_available = info.tertiary.available;
-            state.primary_left = std::clamp(100.0 - info.primary.used_percent, 0.0, 100.0);
-            state.secondary_left = std::clamp(100.0 - info.secondary.used_percent, 0.0, 100.0);
-            state.tertiary_left = std::clamp(100.0 - info.tertiary.used_percent, 0.0, 100.0);
+            state.primary_used = std::clamp(info.primary.used_percent, 0.0, 100.0);
+            state.secondary_used = std::clamp(info.secondary.used_percent, 0.0, 100.0);
+            state.tertiary_used = std::clamp(info.tertiary.used_percent, 0.0, 100.0);
+            state.primary_reset = info.primary.reset_at;
+            state.secondary_reset = info.secondary.reset_at;
+            state.tertiary_reset = info.tertiary.reset_at;
             state.status = "Updated";
             state.last_refresh_ms = now_ms();
             state.busy = false;
-            diagnostics_log("provider refresh success provider=" + std::string(provider_key(provider_index)) + " primary_row=" + state.primary_row + " secondary_row=" + state.secondary_row + " primary_left=" + std::to_string(state.primary_left) + " secondary_left=" + std::to_string(state.secondary_left));
+            diagnostics_log("provider refresh success provider=" + std::string(provider_key(provider_index)) + " primary_row=" + state.primary_row + " secondary_row=" + state.secondary_row + " primary_used=" + std::to_string(state.primary_used) + " secondary_used=" + std::to_string(state.secondary_used));
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(g_app.mutex);
             auto& state = g_app.providers[provider_index];
@@ -504,7 +577,7 @@ void begin_gemini_login() {
         g_ui.oauth_code_mode = true;
         g_ui.oauth_code_input_focused = true;
         g_ui.oauth_code_input.clear();
-        set_target_height(kPanelApiKeyHeight);
+        set_target_height(wanted_panel_height());
         SDL_StartTextInput(g_ui.window);
         if (!g_ui.visible) show_panel();
     } catch (const std::exception& e) {
@@ -557,7 +630,7 @@ void login_async_for(int provider_index) {
         g_ui.api_key_mode = true;
         g_ui.api_input_focused = true;
         g_ui.api_key_input.clear();
-        set_target_height(kPanelApiKeyHeight);
+        set_target_height(wanted_panel_height());
         SDL_StartTextInput(g_ui.window);
         if (!g_ui.visible) show_panel();
         return;
@@ -714,14 +787,18 @@ void outline_round(Rect r, float radius, Uint8 cr, Uint8 cg, Uint8 cb) {
     }
 }
 
-TTF_Font* pick_font(bool bold) {
+TTF_Font* pick_font(bool bold, bool small = false) {
+    if (small) {
+        if (bold && g_ui.font_small_bold) return g_ui.font_small_bold;
+        if (g_ui.font_small) return g_ui.font_small;
+    }
     return bold && g_ui.font_bold ? g_ui.font_bold : g_ui.font;
 }
 
-std::pair<int, int> measure_text(const std::string& s, bool bold = false) {
+std::pair<int, int> measure_text(const std::string& s, bool bold = false, bool small = false) {
     int w = 0;
     int h = 0;
-    TTF_Font* font = pick_font(bold);
+    TTF_Font* font = pick_font(bold, small);
     if (!font || s.empty()) return {0, 0};
     TTF_GetStringSize(font, s.c_str(), s.size(), &w, &h);
     float scale = std::max(1.0f, g_ui.render_scale);
@@ -731,9 +808,9 @@ std::pair<int, int> measure_text(const std::string& s, bool bold = false) {
     };
 }
 
-void text(float x, float y, const std::string& s, Uint8 r = 231, Uint8 g = 238, Uint8 b = 234, bool bold = false) {
+void text(float x, float y, const std::string& s, Uint8 r = 245, Uint8 g = 245, Uint8 b = 247, bool bold = false, bool small = false) {
     if (s.empty()) return;
-    TTF_Font* font = pick_font(bold);
+    TTF_Font* font = pick_font(bold, small);
     if (!font) return;
     SDL_Surface* surface = TTF_RenderText_Blended(font, s.c_str(), s.size(), color(r, g, b));
     if (!surface) return;
@@ -747,10 +824,10 @@ void text(float x, float y, const std::string& s, Uint8 r = 231, Uint8 g = 238, 
     SDL_DestroySurface(surface);
 }
 
-std::string clip_text(const std::string& s, int max_width, bool bold = false) {
-    if (measure_text(s, bold).first <= max_width) return s;
+std::string clip_text(const std::string& s, int max_width, bool bold = false, bool small = false) {
+    if (measure_text(s, bold, small).first <= max_width) return s;
     std::string out = s;
-    while (!out.empty() && measure_text(out + "...", bold).first > max_width) out.pop_back();
+    while (!out.empty() && measure_text(out + "...", bold, small).first > max_width) out.pop_back();
     return out.empty() ? "..." : out + "...";
 }
 
@@ -761,34 +838,19 @@ std::string masked_input_text(const std::string& value, int max_width) {
 }
 
 void button(Rect r, const std::string& label, bool enabled = true) {
-    aa_round_rect(r, 4,
-        color(enabled ? 41 : 35, enabled ? 48 : 39, enabled ? 52 : 42),
-        color(enabled ? 82 : 55, enabled ? 96 : 61, enabled ? 90 : 64));
-    auto [tw, th] = measure_text(label);
+    aa_round_rect(r, 8,
+        color(enabled ? 36 : 28, enabled ? 36 : 28, enabled ? 38 : 30),
+        color(enabled ? 58 : 42, enabled ? 58 : 42, enabled ? 62 : 46));
+    auto [tw, th] = measure_text(label, false, true);
     float tx = r.x + std::max(6.0f, (r.w - static_cast<float>(tw)) / 2.0f);
     float ty = r.y + std::max(2.0f, (r.h - static_cast<float>(th)) / 2.0f);
-    text(tx, ty, label, enabled ? 238 : 115, enabled ? 243 : 123, enabled ? 240 : 119);
+    text(tx, ty, label, enabled ? 245 : 120, enabled ? 245 : 120, enabled ? 247 : 122, false, true);
 }
 
-void tab(Rect r, const std::string& label, bool selected) {
-    aa_round_rect(r, 4,
-        color(selected ? 46 : 30, selected ? 57 : 35, selected ? 55 : 38),
-        color(selected ? 82 : 62, selected ? 172 : 70, selected ? 123 : 74));
-    auto [tw, th] = measure_text(label);
-    text(r.x + (r.w - tw) / 2.0f, r.y + (r.h - th) / 2.0f - 1.0f,
-        label, selected ? 246 : 171, selected ? 249 : 181, selected ? 247 : 176);
-}
-
-void usage_bar(float x, float y, float width, const std::string& label, const std::string& detail, double left, bool blue) {
-    std::string shown = detail;
-    if (auto p = shown.find(": "); p != std::string::npos) shown = shown.substr(p + 2);
-    shown = clip_text(shown, 205);
-    text(x, y, label);
-    text(x + 70, y, shown, 174, 184, 179);
-    fill({x, y + 20, width, 10}, 47, 54, 58);
-    float fw = static_cast<float>(std::clamp(left, 0.0, 100.0) / 100.0 * width);
-    fill({x, y + 20, fw, 10}, blue ? 82 : 68, blue ? 145 : 188, blue ? 224 : 126);
-    outline({x, y + 20, width, 10}, 78, 88, 84);
+void usage_track(float x, float y, float width, double used, bool weekly) {
+    fill_round({x, y, width, 6}, 3, 44, 44, 48);
+    float fw = static_cast<float>(std::clamp(used, 0.0, 100.0) / 100.0 * width);
+    if (fw > 0.5f) fill_round({x, y, std::max(6.0f, fw), 6}, 3, weekly ? 48 : 240, weekly ? 209 : 196, weekly ? 88 : 64);
 }
 
 SDL_FPoint rotate_point(float x, float y, float cx, float cy, float radians) {
@@ -847,239 +909,211 @@ void filled_polygon(const std::vector<SDL_FPoint>& points, SDL_Color col) {
         indices.data(), static_cast<int>(indices.size()));
 }
 
-void pushpin_icon(Rect r, bool active) {
-    static constexpr int w = 18;
-    static constexpr int h = 18;
-    static constexpr unsigned char mask[w * h] = {
-        0,0,0,0,0,0,0,0,0,0,0,170,255,80,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,255,255,255,255,170,0,0,0,
-        0,0,0,0,0,0,0,0,0,170,255,255,255,255,255,170,0,0,
-        0,0,0,0,0,0,0,0,80,255,255,255,255,255,255,255,170,0,
-        0,0,0,0,0,255,255,255,255,255,255,255,255,255,255,255,255,0,
-        0,0,0,0,255,255,255,255,255,255,255,255,255,255,255,255,170,0,
-        0,0,0,0,255,255,255,255,255,255,255,255,255,255,255,255,0,0,
-        0,0,0,0,170,255,255,255,255,255,255,255,255,255,170,0,0,0,
-        0,0,0,0,80,255,255,255,255,255,255,255,255,80,0,0,0,0,
-        0,0,0,0,0,80,255,255,255,255,255,255,255,0,0,0,0,0,
-        0,0,0,0,0,170,255,255,255,255,255,255,255,0,0,0,0,0,
-        0,0,0,0,170,255,170,80,255,255,255,255,170,0,0,0,0,0,
-        0,0,0,170,255,170,0,0,80,255,255,255,0,0,0,0,0,0,
-        0,0,0,170,170,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-    };
-
-    SDL_Color c = active ? color(123, 222, 159) : color(178, 184, 180);
-    float scale = 0.72f;
-    float px = r.x + (r.w - w * scale) / 2.0f;
-    float py = r.y + (r.h - h * scale) / 2.0f;
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            unsigned char a = mask[y * w + x];
-            if (!a) continue;
-            fill({px + x * scale, py + y * scale, scale + 0.25f, scale + 0.25f},
-                c.r, c.g, c.b, a);
-        }
+void stroke_arc(float cx, float cy, float radius, float thickness, float t0, float t1, SDL_Color c) {
+    if (t1 <= t0) return;
+    int steps = std::max(8, static_cast<int>(std::ceil(std::abs(t1 - t0) * radius * 1.6f)));
+    SDL_FPoint prev{};
+    for (int i = 0; i <= steps; ++i) {
+        float t = t0 + (t1 - t0) * (static_cast<float>(i) / static_cast<float>(steps));
+        SDL_FPoint p{cx + std::sin(t) * radius, cy - std::cos(t) * radius};
+        if (i) thick_line(prev, p, thickness, c);
+        prev = p;
     }
 }
 
-void draw_pin(Rect r, bool active) {
-    button(r, "", true);
-    pushpin_icon(r, active);
+void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent) {
+    stroke_arc(cx, cy, radius, 5.0f, 0.0f, 6.2831853f, color(58, 58, 62));
+    float sweep = static_cast<float>(std::clamp(used, 0.0, 100.0) / 100.0 * 6.2831853f);
+    if (sweep > 0.02f) stroke_arc(cx, cy, radius, 5.0f, 0.0f, sweep, accent);
 }
 
-void draw_refresh(Rect r, bool enabled) {
-    button(r, "", enabled);
-    SDL_Color c = enabled ? color(231, 238, 234) : color(115, 123, 119);
-    float s = 0.70f;
-    float ox = r.x + (r.w - 24.0f * s) / 2.0f;
-    float oy = r.y + (r.h - 24.0f * s) / 2.0f;
-    auto p = [&](float x, float y) { return SDL_FPoint{ox + x * s, oy + y * s}; };
-    auto line = [&](SDL_FPoint a, SDL_FPoint b) { thick_line(a, b, 2.1f, c); };
-
-    line(p(21, 2), p(21, 8));
-    line(p(21, 8), p(15, 8));
-    line(p(3, 22), p(3, 16));
-    line(p(3, 16), p(9, 16));
-
-    std::vector<SDL_FPoint> top = {
-        p(3, 12), p(4.0f, 8.6f), p(6.6f, 5.9f), p(10.2f, 4.6f),
-        p(14.0f, 4.6f), p(18.0f, 5.3f), p(21, 8)
+void draw_provider_glyph(float cx, float cy, int index, SDL_Color c) {
+    auto line = [&](float x0, float y0, float x1, float y1, float w = 1.8f) {
+        thick_line({cx + x0, cy + y0}, {cx + x1, cy + y1}, w, c);
     };
-    std::vector<SDL_FPoint> bottom = {
-        p(21, 12), p(20.0f, 15.4f), p(17.4f, 18.1f), p(13.8f, 19.4f),
-        p(10.0f, 19.4f), p(6.0f, 18.7f), p(3, 16)
-    };
-    for (std::size_t i = 1; i < top.size(); ++i) line(top[i - 1], top[i]);
-    for (std::size_t i = 1; i < bottom.size(); ++i) line(bottom[i - 1], bottom[i]);
+    if (index == 1) {
+        line(0, -6.5f, 0, 6.5f, 2.0f);
+        line(-6.5f, 0, 6.5f, 0, 2.0f);
+        line(-4.6f, -4.6f, 4.6f, 4.6f, 2.0f);
+        line(-4.6f, 4.6f, 4.6f, -4.6f, 2.0f);
+    } else if (index == 3) {
+        line(0, -6.5f, 4.8f, 0, 2.0f);
+        line(4.8f, 0, 0, 6.5f, 2.0f);
+        line(0, 6.5f, -4.8f, 0, 2.0f);
+        line(-4.8f, 0, 0, -6.5f, 2.0f);
+        fill({cx - 1.4f, cy - 1.4f, 2.8f, 2.8f}, c.r, c.g, c.b);
+    } else if (index == 2) {
+        line(-5, -4, 4, -4, 2.0f);
+        line(4, -4, -4, 4, 2.0f);
+        line(-4, 4, 5, 4, 2.0f);
+    } else if (index == 4) {
+        line(-5, -5, 5, 5, 2.1f);
+        line(-5, 5, 5, -5, 2.1f);
+    } else {
+        line(-4.5f, -5.5f, 3.5f, -5.5f, 1.8f);
+        line(-4.5f, -5.5f, -4.5f, 5.5f, 1.8f);
+        line(-4.5f, 5.5f, 4.5f, 5.5f, 1.8f);
+        line(4.5f, 5.5f, 4.5f, -3.0f, 1.8f);
+        line(3.5f, -5.5f, 4.5f, -3.0f, 1.8f);
+        line(-2.2f, -1.5f, 2.0f, -1.5f, 1.6f);
+        line(-2.2f, 1.5f, 2.0f, 1.5f, 1.6f);
+    }
 }
 
-void draw_chevron(Rect r, bool open) {
-    button(r, "", true);
-    set_color(231, 238, 234, 255);
+void draw_gear_icon(Rect r) {
     float cx = r.x + r.w / 2.0f;
     float cy = r.y + r.h / 2.0f;
-    if (open) {
-        SDL_RenderLine(g_ui.renderer, cx - 5, cy + 3, cx, cy - 3);
-        SDL_RenderLine(g_ui.renderer, cx, cy - 3, cx + 5, cy + 3);
-    } else {
-        SDL_RenderLine(g_ui.renderer, cx - 5, cy - 3, cx, cy + 3);
-        SDL_RenderLine(g_ui.renderer, cx, cy + 3, cx + 5, cy - 3);
+    SDL_Color c = color(180, 180, 184);
+    stroke_arc(cx, cy, 5.2f, 1.7f, 0, 6.2831853f, c);
+    for (int i = 0; i < 6; ++i) {
+        float a = static_cast<float>(i) * 1.0471976f;
+        thick_line({cx + std::sin(a) * 4.2f, cy - std::cos(a) * 4.2f}, {cx + std::sin(a) * 7.4f, cy - std::cos(a) * 7.4f}, 2.2f, c);
     }
 }
 
-void draw_account_info(Rect r) {
-    button(r, "i", true);
+void draw_pin_icon(Rect r, bool active) {
+    float cx = r.x + r.w / 2.0f;
+    float cy = r.y + r.h / 2.0f - 1.0f;
+    SDL_Color c = active ? color(245, 245, 247) : color(180, 180, 184);
+    thick_line({cx, cy - 6}, {cx, cy + 7}, 1.7f, c);
+    thick_line({cx - 4.5f, cy - 3.5f}, {cx + 4.5f, cy - 3.5f}, 1.7f, c);
+    thick_line({cx - 4.5f, cy - 3.5f}, {cx, cy + 2.5f}, 1.7f, c);
+    thick_line({cx + 4.5f, cy - 3.5f}, {cx, cy + 2.5f}, 1.7f, c);
 }
 
-void draw_provider_menu(const int* tab_providers) {
-    if (!g_ui.provider_menu_open || g_ui.provider_menu_tab < 0 || g_ui.provider_menu_tab >= kTabCount) return;
-    Rect anchor = tab_rect(g_ui.provider_menu_tab);
-    float x = std::clamp(anchor.x, 6.0f, static_cast<float>(kPanelWidth - kProviderMenuWidth - 6));
-    float y = anchor.y + anchor.h + 4.0f;
-    float h = 8.0f + kProviderCount * static_cast<float>(kProviderMenuRowHeight);
-    g_ui.provider_menu_rect = {x, y, static_cast<float>(kProviderMenuWidth), h};
-    aa_round_rect(g_ui.provider_menu_rect, 6, color(24, 28, 30), color(75, 88, 84));
-    for (int i = 0; i < kProviderCount; ++i) {
-        Rect option{x + 4, y + 4 + i * static_cast<float>(kProviderMenuRowHeight), static_cast<float>(kProviderMenuWidth - 8), static_cast<float>(kProviderMenuRowHeight - 2)};
-        g_ui.provider_menu_options[i] = option;
-        bool is_current = (i == tab_providers[g_ui.provider_menu_tab]);
-        aa_round_rect(option, 4,
-            color(is_current ? 40 : 31, is_current ? 50 : 36, is_current ? 46 : 39),
-            color(is_current ? 75 : 50, is_current ? 160 : 60, is_current ? 115 : 58));
-        auto [tw, th] = measure_text(provider_label(i));
-        float tx = option.x + 8.0f;
-        float ty = option.y + std::max(2.0f, (option.h - static_cast<float>(th)) / 2.0f);
-        text(tx, ty, provider_label(i), is_current ? 246 : 205, is_current ? 249 : 212, is_current ? 247 : 208);
-        if (is_current) {
-            fill({option.x + option.w - 14.0f, option.y + (option.h - 6.0f) / 2.0f, 6.0f, 6.0f}, 82, 172, 123);
-        }
+void draw_status_dot(float x, float y, bool on) {
+    fill_round({x, y, 7, 7}, 3.5f, on ? 48 : 72, on ? 209 : 72, on ? 88 : 76);
+}
+
+void draw_left_card_chrome(float y, float h) {
+    g_ui.callout_rect = {0, y, static_cast<float>(kCalloutWidth), h};
+    aa_round_rect(g_ui.callout_rect, static_cast<float>(kCardRadius), color(18, 18, 20), color(42, 42, 46));
+    float cy = y + h * 0.5f;
+    filled_polygon({
+        {static_cast<float>(kCalloutWidth) - 1.0f, cy - 8.0f},
+        {static_cast<float>(kCalloutWidth) - 1.0f, cy + 8.0f},
+        {static_cast<float>(kCalloutWidth + kTailWidth), cy}
+    }, color(18, 18, 20));
+}
+
+void draw_input_field(Rect box, const std::string& masked, bool focused) {
+    aa_round_rect(box, 8, color(28, 28, 32), focused ? color(80, 80, 86) : color(52, 52, 56));
+    text(box.x + 10, box.y + 8, masked, 245, 245, 247, false, true);
+    if (focused && ((SDL_GetTicks() / 500) % 2 == 0)) {
+        auto [tw, th] = measure_text(masked, false, true);
+        fill({box.x + 10 + static_cast<float>(tw) + 2.0f, box.y + 7, 1.5f, 16}, 245, 245, 247);
     }
 }
 
 void draw_panel() {
     set_color(0, 0, 0, 0);
     SDL_RenderClear(g_ui.renderer);
-    aa_round_rect({0, 0, static_cast<float>(kPanelWidth), static_cast<float>(g_ui.panel_height)}, 9,
-        color(17, 20, 22), color(67, 80, 83));
-    aa_round_rect({1, 1, static_cast<float>(kPanelWidth - 2), static_cast<float>(g_ui.panel_height - 2)}, 8,
-        color(23, 26, 28), color(37, 45, 47));
-    fill({10, 2, static_cast<float>(kPanelWidth - 20), 1}, 70, 82, 84, 92);
-
-    int selected;
-    int tab_providers[kTabCount]{};
-    bool busy, logged_in;
-    std::string status, primary, secondary, tertiary, primary_row, secondary_row, tertiary_row;
-    bool primary_available, secondary_available, tertiary_available;
-    double primary_left, secondary_left, tertiary_left;
+    int selected = 0;
+    bool enabled[kProviderCount]{};
+    ProviderState states[kProviderCount]{};
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         selected = g_app.selected;
-        for (int i = 0; i < kTabCount; ++i) tab_providers[i] = g_app.tab_providers[i];
-        const auto& state = g_app.providers[selected];
-        busy = state.busy;
-        logged_in = state.logged_in;
-        status = state.status;
-        primary = state.primary;
-        secondary = state.secondary;
-        tertiary = state.tertiary;
-        primary_row = state.primary_row;
-        secondary_row = state.secondary_row;
-        tertiary_row = state.tertiary_row;
-        primary_available = state.primary_available;
-        secondary_available = state.secondary_available;
-        tertiary_available = state.tertiary_available;
-        primary_left = state.primary_left;
-        secondary_left = state.secondary_left;
-        tertiary_left = state.tertiary_left;
-    }
-
-    for (int i = 0; i < kTabCount; ++i) {
-        tab_rect(i) = {10.0f + i * 66.0f, 12.0f, 60.0f, 24.0f};
-        tab(tab_rect(i), provider_label(tab_providers[i]), selected == tab_providers[i]);
-    }
-
-    g_ui.top_refresh_button = {216, 12, 24, 24};
-    g_ui.pin_button = {244, 12, 24, 24};
-    g_ui.drawer_button = {270, 12, 24, 24};
-    draw_refresh(g_ui.top_refresh_button, logged_in && !busy);
-    draw_pin(g_ui.pin_button, g_ui.pinned);
-    draw_chevron(g_ui.drawer_button, g_ui.drawer_open);
-
-    if (g_ui.api_key_mode) {
-        text(10, 52, "GLM API key");
-        text(10, 72, "Paste key. Saved in platform secret store.", 174, 184, 179);
-        g_ui.api_input = {10, 100, 280, 28};
-        fill(g_ui.api_input, 30, 35, 38);
-        outline(g_ui.api_input, g_ui.api_input_focused ? 123 : 82, g_ui.api_input_focused ? 222 : 172, g_ui.api_input_focused ? 159 : 123);
-        std::string masked = masked_input_text(g_ui.api_key_input, static_cast<int>(g_ui.api_input.w) - 16);
-        text(g_ui.api_input.x + 8, g_ui.api_input.y + 8, masked);
-        if (g_ui.api_input_focused && ((SDL_GetTicks() / 500) % 2 == 0)) {
-            auto [tw, th] = measure_text(masked);
-            float cx = g_ui.api_input.x + 8 + static_cast<float>(tw) + 2.0f;
-            fill({cx, g_ui.api_input.y + 6, 1.5f, 16}, 231, 238, 234);
+        for (int i = 0; i < kProviderCount; ++i) {
+            enabled[i] = g_app.enabled[i];
+            states[i] = g_app.providers[i];
         }
-        g_ui.api_ok = {10, 142, 128, 28};
-        g_ui.api_cancel = {152, 142, 138, 28};
-        button(g_ui.api_ok, "Save", !g_ui.api_key_input.empty());
-        button(g_ui.api_cancel, "Cancel", true);
-        SDL_RenderPresent(g_ui.renderer);
-        return;
     }
-
-    if (g_ui.oauth_code_mode) {
-        text(10, 52, "Gemini verification code");
-        text(10, 72, "Paste the code shown by Antigravity.", 174, 184, 179);
-        g_ui.oauth_code_input_box = {10, 100, 280, 28};
-        fill(g_ui.oauth_code_input_box, 30, 35, 38);
-        outline(g_ui.oauth_code_input_box, g_ui.oauth_code_input_focused ? 123 : 82, g_ui.oauth_code_input_focused ? 222 : 172, g_ui.oauth_code_input_focused ? 159 : 123);
-        std::string masked = masked_input_text(g_ui.oauth_code_input, static_cast<int>(g_ui.oauth_code_input_box.w) - 16);
-        text(g_ui.oauth_code_input_box.x + 8, g_ui.oauth_code_input_box.y + 8, masked);
-        if (g_ui.oauth_code_input_focused && ((SDL_GetTicks() / 500) % 2 == 0)) {
-            auto [tw, th] = measure_text(masked);
-            float cx = g_ui.oauth_code_input_box.x + 8 + static_cast<float>(tw) + 2.0f;
-            fill({cx, g_ui.oauth_code_input_box.y + 6, 1.5f, 16}, 231, 238, 234);
+    int visible = 0;
+    int visible_index[kProviderCount];
+    for (int i = 0; i < kProviderCount; ++i) if (enabled[i]) visible_index[visible++] = i;
+    if (visible == 0) {
+        visible_index[0] = selected;
+        visible = 1;
+    }
+    float dx = dock_x();
+    float dock_h = static_cast<float>(std::max(kDockPad + visible * kRingSlot + kDockFooter, kCalloutHeight));
+    g_ui.dock_rect = {dx, 0, static_cast<float>(kDockWidth), dock_h};
+    aa_round_rect(g_ui.dock_rect, static_cast<float>(kDockRadius), color(18, 18, 20), color(42, 42, 46));
+    float selected_cy = kDockPad + kRingSize * 0.5f;
+    for (int slot = 0; slot < kProviderCount; ++slot) g_ui.ring_slots[slot] = {};
+    for (int n = 0; n < visible; ++n) {
+        int i = visible_index[n];
+        float cy = static_cast<float>(kDockPad + n * kRingSlot + kRingSize * 0.5f);
+        float cx = dx + kDockWidth * 0.5f;
+        g_ui.ring_slots[i] = {cx - 28, cy - 28, 56, 70};
+        if (i == selected) selected_cy = cy;
+        SDL_Color accent = provider_accent(i);
+        double used = states[i].logged_in ? states[i].primary_used : 0;
+        draw_ring(cx, cy, 23.0f, used, accent);
+        draw_provider_glyph(cx, cy, i, accent);
+        std::string pct = states[i].logged_in ? (std::to_string(static_cast<int>(std::round(used))) + "%") : "--";
+        auto [tw, th] = measure_text(pct, false, true);
+        text(cx - tw * 0.5f, cy + 26.0f, pct, 245, 245, 247, false, true);
+    }
+    float footer_y = static_cast<float>(kDockPad + visible * kRingSlot + 6);
+    g_ui.gear_button = {dx + 16, footer_y, 28, 28};
+    g_ui.pin_button = {dx + 48, footer_y, 28, 28};
+    draw_gear_icon(g_ui.gear_button);
+    draw_pin_icon(g_ui.pin_button, g_ui.pinned);
+    bool left_open = g_ui.callout_open || g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode;
+    if (left_open) {
+        float card_h = g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode ? static_cast<float>(settings_height()) : static_cast<float>(kCalloutHeight);
+        float card_y = 0;
+        if (!g_ui.settings_open && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
+            card_y = std::clamp(selected_cy - card_h * 0.5f, 0.0f, static_cast<float>(g_ui.panel_height) - card_h);
         }
-        g_ui.oauth_code_ok = {10, 142, 128, 28};
-        g_ui.oauth_code_cancel = {152, 142, 138, 28};
-        button(g_ui.oauth_code_ok, "Verify", !g_ui.oauth_code_input.empty());
-        button(g_ui.oauth_code_cancel, "Cancel", true);
-        SDL_RenderPresent(g_ui.renderer);
-        return;
+        draw_left_card_chrome(card_y, card_h);
+        if (g_ui.api_key_mode) {
+            text(18, card_y + 16, "GLM API key", 245, 245, 247, true);
+            text(18, card_y + 40, "Paste key. Saved in the platform secret store.", 142, 142, 147, false, true);
+            g_ui.api_input = {18, card_y + 68, 300, 32};
+            draw_input_field(g_ui.api_input, masked_input_text(g_ui.api_key_input, 280), g_ui.api_input_focused);
+            g_ui.api_ok = {18, card_y + 112, 144, 30};
+            g_ui.api_cancel = {174, card_y + 112, 144, 30};
+            button(g_ui.api_ok, "Save", !g_ui.api_key_input.empty());
+            button(g_ui.api_cancel, "Cancel", true);
+        } else if (g_ui.oauth_code_mode) {
+            text(18, card_y + 16, "Gemini verification", 245, 245, 247, true);
+            text(18, card_y + 40, "Paste the code shown by Antigravity.", 142, 142, 147, false, true);
+            g_ui.oauth_code_input_box = {18, card_y + 68, 300, 32};
+            draw_input_field(g_ui.oauth_code_input_box, masked_input_text(g_ui.oauth_code_input, 280), g_ui.oauth_code_input_focused);
+            g_ui.oauth_code_ok = {18, card_y + 112, 144, 30};
+            g_ui.oauth_code_cancel = {174, card_y + 112, 144, 30};
+            button(g_ui.oauth_code_ok, "Verify", !g_ui.oauth_code_input.empty());
+            button(g_ui.oauth_code_cancel, "Cancel", true);
+        } else if (g_ui.settings_open) {
+            text(18, card_y + 16, "Settings", 245, 245, 247, true);
+            for (int i = 0; i < kProviderCount; ++i) {
+                float y = card_y + static_cast<float>(kSettingsHeader + i * kSettingsRowHeight);
+                SDL_Color accent = provider_accent(i);
+                draw_provider_glyph(32, y + 22, i, accent);
+                text(48, y + 8, provider_label(i), 245, 245, 247, true, true);
+                text(48, y + 26, states[i].logged_in ? (states[i].account_label.empty() ? "Connected" : clip_text(states[i].account_label, 140, false, true)) : "Not signed in", 142, 142, 147, false, true);
+                g_ui.settings_toggle[i] = {210, y + 12, 36, 22};
+                aa_round_rect(g_ui.settings_toggle[i], 11, enabled[i] ? color(48, 209, 88) : color(58, 58, 62), enabled[i] ? color(48, 209, 88) : color(58, 58, 62));
+                fill_round({g_ui.settings_toggle[i].x + (enabled[i] ? 18.0f : 4.0f), y + 15, 16, 16}, 8, 245, 245, 247);
+                g_ui.settings_action[i] = {252, y + 12, 68, 24};
+                button(g_ui.settings_action[i], states[i].logged_in ? "Sign out" : (i == 2 ? "Key" : "Sign in"), !states[i].busy);
+            }
+            g_ui.settings_refresh = {18, card_y + card_h - 42, 150, 28};
+            g_ui.settings_quit = {178, card_y + card_h - 42, 140, 28};
+            button(g_ui.settings_refresh, "Refresh all", true);
+            button(g_ui.settings_quit, "Quit", true);
+        } else {
+            const auto& state = states[selected];
+            draw_provider_glyph(28, card_y + 26, selected, provider_accent(selected));
+            text(44, card_y + 16, provider_label(selected), 245, 245, 247, true);
+            draw_status_dot(static_cast<float>(kCalloutWidth) - 28, card_y + 22, state.logged_in && !state.busy);
+            auto row = [&](float y, const std::string& label, bool available, double used, long long reset, bool weekly) {
+                if (!available) return;
+                text(18, y, label, 245, 245, 247, false, true);
+                std::string reset_text = format_reset_phrase(reset);
+                auto [rw, rh] = measure_text(reset_text, false, true);
+                text(static_cast<float>(kCalloutWidth) - 18 - rw, y, reset_text, 142, 142, 147, false, true);
+                usage_track(18, y + 20, static_cast<float>(kCalloutWidth) - 36, used, weekly);
+                text(18, y + 30, std::to_string(static_cast<int>(std::round(used))) + "% Used", 174, 174, 178, false, true);
+            };
+            float y = card_y + 48;
+            if (state.primary_available) { row(y, state.primary_row, true, state.primary_used, state.primary_reset, false); y += 56; }
+            if (state.secondary_available) row(y, state.secondary_row, true, state.secondary_used, state.secondary_reset, true);
+        }
     }
-
-    float usage_y = 46;
-    if (primary_available) {
-        usage_bar(10, usage_y, 280, primary_row, primary, primary_left, false);
-        usage_y += kUsageRowHeight;
-    }
-    if (secondary_available) {
-        usage_bar(10, usage_y, 280, secondary_row, secondary, secondary_left, true);
-        usage_y += kUsageRowHeight;
-    }
-    if (tertiary_available) {
-        usage_bar(10, usage_y, 280, tertiary_row, tertiary, tertiary_left, true);
-        usage_y += kUsageRowHeight;
-    }
-
-    float drawer_y = usage_y + 10;
-    g_ui.login_button = {10, drawer_y, 120, 28};
-    g_ui.refresh_button = {138, drawer_y, 152, 28};
-    g_ui.warm_button = {10, drawer_y + 38, 280, 28};
-    g_ui.logout_button = {10, drawer_y + 76, 120, 28};
-    g_ui.quit_button = {138, drawer_y + 76, 152, 28};
-
-    if (g_ui.drawer_open) {
-        button(g_ui.login_button, logged_in ? (selected == 2 ? "Key saved" : "Logged in") : (selected == 2 ? "Set API key" : "Login"), !busy && !logged_in);
-        button(g_ui.refresh_button, busy ? "Refreshing..." : "Refresh now", !busy && logged_in);
-        button(g_ui.warm_button, selected == 3 ? "Unavailable" : (busy ? "Working..." : "Warm now"), !busy && logged_in && selected != 3);
-        button(g_ui.logout_button, "Logout", logged_in);
-        button(g_ui.quit_button, "Quit", true);
-        if (status_visible(status)) text(10, static_cast<float>(g_ui.panel_height - 20), clip_text(status, 280), 174, 184, 179);
-    }
-    draw_provider_menu(tab_providers);
     SDL_RenderPresent(g_ui.renderer);
 }
 
@@ -1138,67 +1172,41 @@ void create_tray() {
     }
 }
 
-void select_provider_for_tab(int tab_index, int provider_index) {
-    bool changed = false;
+void save_layout() {
+    std::string json = "{";
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
-        int previous = g_app.tab_providers[tab_index];
-        if (previous != provider_index) {
-            for (int i = 0; i < kTabCount; ++i) {
-                if (i != tab_index && g_app.tab_providers[i] == provider_index) {
-                    g_app.tab_providers[i] = previous;
-                    break;
-                }
-            }
-            g_app.tab_providers[tab_index] = provider_index;
-            changed = true;
-        }
-        g_app.selected = provider_index;
+        json += "\"selected\":" + std::to_string(g_app.selected);
+        for (int i = 0; i < kProviderCount; ++i) json += ",\"e" + std::to_string(i) + "\":" + (g_app.enabled[i] ? "1" : "0");
     }
-    if (changed) {
-        std::string json = "{";
-        {
-            std::lock_guard<std::mutex> lock(g_app.mutex);
-            for (int i = 0; i < kTabCount; ++i) {
-                if (i) json += ",";
-                json += "\"tab" + std::to_string(i) + "\":" + std::to_string(g_app.tab_providers[i]);
-            }
-        }
-        json += "}";
-        try { credential_save_named("layout", json); } catch (const std::exception&) { }
-    }
-    if (provider_has_auth(provider_index)) {
-        refresh_usage_async_for(provider_index, false);
-    }
+    json += "}";
+    try { credential_save_named("layout", json); } catch (const std::exception&) { }
+}
+
+void logout_provider(int index) {
+    clear_credentials_provider(provider_key(index));
+    std::lock_guard<std::mutex> lock(g_app.mutex);
+    auto& state = g_app.providers[index];
+    ++state.operation_id;
+    state.busy = false;
+    state.logged_in = false;
+    state.account.clear();
+    state.account_label.clear();
+    state.status = "Logged out";
+    state.primary_used = 0;
+    state.secondary_used = 0;
+    state.primary_reset = 0;
+    state.secondary_reset = 0;
+    state.last_refresh_ms = 0;
+}
+
+void handle_right_click(float, float) {
+    g_ui.settings_open = !g_ui.settings_open;
+    if (g_ui.settings_open) g_ui.callout_open = false;
     set_target_height(wanted_panel_height());
 }
 
-void handle_right_click(float x, float y) {
-    if (g_ui.api_key_mode || g_ui.oauth_code_mode) return;
-    int tab_index = tab_index_at(x, y);
-    if (tab_index >= 0) {
-        if (g_ui.provider_menu_open && g_ui.provider_menu_tab == tab_index) {
-            g_ui.provider_menu_open = false;
-            g_ui.provider_menu_tab = -1;
-        } else {
-            g_ui.provider_menu_open = true;
-            g_ui.provider_menu_tab = tab_index;
-        }
-    } else {
-        g_ui.provider_menu_open = false;
-        g_ui.provider_menu_tab = -1;
-    }
-}
-
 void handle_click(float x, float y) {
-    if (g_ui.provider_menu_open) {
-        int provider_index = -1;
-        for (int i = 0; i < kProviderCount; ++i) if (contains(g_ui.provider_menu_options[i], x, y)) { provider_index = i; break; }
-        if (provider_index >= 0) select_provider_for_tab(g_ui.provider_menu_tab, provider_index);
-        g_ui.provider_menu_open = false;
-        g_ui.provider_menu_tab = -1;
-        return;
-    }
     if (g_ui.api_key_mode) {
         if (contains(g_ui.api_input, x, y)) {
             g_ui.api_input_focused = true;
@@ -1212,7 +1220,6 @@ void handle_click(float x, float y) {
         }
         return;
     }
-
     if (g_ui.oauth_code_mode) {
         if (contains(g_ui.oauth_code_input_box, x, y)) {
             g_ui.oauth_code_input_focused = true;
@@ -1221,60 +1228,69 @@ void handle_click(float x, float y) {
         else if (contains(g_ui.oauth_code_cancel, x, y)) cancel_gemini_login();
         return;
     }
-
-    int selected = selected_provider();
-    bool busy, logged_in;
-    {
-        std::lock_guard<std::mutex> lock(g_app.mutex);
-        busy = g_app.providers[selected].busy;
-        logged_in = g_app.providers[selected].logged_in;
+    if (contains(g_ui.pin_button, x, y)) {
+        g_ui.pinned = !g_ui.pinned;
+        return;
     }
-
-    int tab_index = tab_index_at(x, y);
-    if (tab_index >= 0) {
-        int chosen;
+    if (contains(g_ui.gear_button, x, y)) {
+        g_ui.settings_open = !g_ui.settings_open;
+        g_ui.callout_open = !g_ui.settings_open;
+        set_target_height(wanted_panel_height());
+        return;
+    }
+    if (g_ui.settings_open) {
+        for (int i = 0; i < kProviderCount; ++i) {
+            if (contains(g_ui.settings_toggle[i], x, y)) {
+                {
+                    std::lock_guard<std::mutex> lock(g_app.mutex);
+                    bool others = false;
+                    for (int j = 0; j < kProviderCount; ++j) if (j != i && g_app.enabled[j]) others = true;
+                    if (g_app.enabled[i] && !others) return;
+                    g_app.enabled[i] = !g_app.enabled[i];
+                    if (g_app.enabled[i]) g_app.selected = i;
+                    else if (g_app.selected == i) {
+                        for (int j = 0; j < kProviderCount; ++j) if (g_app.enabled[j]) { g_app.selected = j; break; }
+                    }
+                }
+                save_layout();
+                set_target_height(wanted_panel_height());
+                return;
+            }
+            if (contains(g_ui.settings_action[i], x, y)) {
+                bool logged_in = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_app.mutex);
+                    logged_in = g_app.providers[i].logged_in;
+                    g_app.selected = i;
+                }
+                if (logged_in) logout_provider(i);
+                else login_async_for(i);
+                return;
+            }
+        }
+        if (contains(g_ui.settings_refresh, x, y)) {
+            for (int i = 0; i < kProviderCount; ++i) if (provider_has_auth(i)) refresh_usage_async_for(i, true);
+            return;
+        }
+        if (contains(g_ui.settings_quit, x, y)) {
+            g_quit = true;
+            return;
+        }
+        return;
+    }
+    for (int i = 0; i < kProviderCount; ++i) {
+        if (!contains(g_ui.ring_slots[i], x, y)) continue;
+        bool same = false;
         {
             std::lock_guard<std::mutex> lock(g_app.mutex);
-            g_app.selected = g_app.tab_providers[tab_index];
-            chosen = g_app.selected;
+            same = g_app.selected == i && g_ui.callout_open;
+            g_app.selected = i;
         }
-        if (provider_has_auth(chosen)) {
-            refresh_usage_async_for(chosen, false);
-        }
+        g_ui.callout_open = !same;
+        g_ui.settings_open = false;
+        if (provider_has_auth(i)) refresh_usage_async_for(i, false);
         set_target_height(wanted_panel_height());
-    } else if (contains(g_ui.top_refresh_button, x, y) && !busy && logged_in) {
-        refresh_usage_async_for(selected, true);
-    } else if (contains(g_ui.pin_button, x, y)) {
-        g_ui.pinned = !g_ui.pinned;
-    } else if (contains(g_ui.drawer_button, x, y)) {
-        anchor_current_bottom();
-        g_ui.drawer_open = !g_ui.drawer_open;
-        set_target_height(wanted_panel_height());
-    } else if (g_ui.drawer_open && contains(g_ui.login_button, x, y) && !busy && !logged_in) {
-        login_async_for(selected);
-    } else if (g_ui.drawer_open && contains(g_ui.refresh_button, x, y) && !busy && logged_in) {
-        refresh_usage_async_for(selected, true);
-    } else if (g_ui.drawer_open && contains(g_ui.warm_button, x, y) && !busy && logged_in && selected != 3) {
-        warm_async_for(selected);
-    } else if (g_ui.drawer_open && contains(g_ui.logout_button, x, y) && logged_in) {
-        clear_credentials_provider(provider_key(selected));
-        std::lock_guard<std::mutex> lock(g_app.mutex);
-        auto& state = g_app.providers[selected];
-        ++state.operation_id;
-        state.busy = false;
-        state.logged_in = false;
-        state.account.clear();
-        state.account_label.clear();
-        state.status = "Logged out";
-        state.primary = std::string(primary_label(selected)) + ": unknown";
-        state.secondary = std::string(secondary_label(selected)) + ": unknown";
-        state.primary_left = 0;
-        state.secondary_left = 0;
-        state.primary_available = true;
-        state.secondary_available = true;
-        state.last_refresh_ms = 0;
-    } else if (g_ui.drawer_open && contains(g_ui.quit_button, x, y)) {
-        g_quit = true;
+        return;
     }
 }
 
@@ -1312,51 +1328,50 @@ void handle_mouse_up(float x, float y) {
     if (!was_dragging || !moved) handle_click(x, y);
 }
 
-void load_tab_layout() {
+void load_layout() {
     auto raw = credential_load_named("layout");
     if (!raw) return;
-    int slots[kTabCount]{};
-    bool valid = true;
-    for (int i = 0; i < kTabCount; ++i) {
-        std::string key = "tab" + std::to_string(i);
-        auto value = json_number(*raw, key);
-        slots[i] = value ? static_cast<int>(*value) : -1;
-        if (slots[i] < 0 || slots[i] >= kProviderCount) valid = false;
-        for (int j = 0; j < i; ++j) if (slots[j] == slots[i]) valid = false;
-    }
-    if (!valid) return;
     std::lock_guard<std::mutex> lock(g_app.mutex);
-    for (int i = 0; i < kTabCount; ++i) g_app.tab_providers[i] = slots[i];
+    if (auto selected = json_number(*raw, "selected")) {
+        int value = static_cast<int>(*selected);
+        if (value >= 0 && value < kProviderCount) g_app.selected = value;
+    }
+    bool any = false;
+    for (int i = 0; i < kProviderCount; ++i) {
+        if (auto flag = json_number(*raw, "e" + std::to_string(i))) {
+            g_app.enabled[i] = *flag != 0;
+            any = true;
+        }
+    }
+    if (!any) {
+        for (int i = 0; i < 3; ++i) {
+            std::string key = "tab" + std::to_string(i);
+            auto value = json_number(*raw, key);
+            if (value && *value >= 0 && *value < kProviderCount) g_app.enabled[static_cast<int>(*value)] = true;
+        }
+    }
 }
 
 void init_state() {
-    for (int i = 0; i < kTabCount; ++i) {
-        tab_rect(i) = {10.0f + i * 66.0f, 12.0f, 60.0f, 24.0f};
-    }
-    load_tab_layout();
+    load_layout();
     std::lock_guard<std::mutex> lock(g_app.mutex);
-    g_app.selected = g_app.tab_providers[0];
     for (int i = 0; i < kProviderCount; ++i) {
         auto& state = g_app.providers[i];
         state.logged_in = provider_has_auth(i);
         state.status = state.logged_in ? "Ready to refresh " + std::string(provider_label(i)) : "Not logged in";
-        if (i == 1) {
-            state.primary = "5h: unknown";
-            state.secondary = "Weekly: unknown";
-        } else if (i == 2) {
+        state.primary_row = primary_row_label(i);
+        state.secondary_row = secondary_row_label(i);
+        if (i == 2) {
             state.status = state.logged_in ? "Ready to refresh GLM" : "No GLM API key saved";
             state.account = state.logged_in ? "GLM API key" : "";
             state.account_label = state.logged_in ? "GLM" : "";
-            state.primary = "5h: unknown";
-            state.secondary = "Requests: unknown";
-        } else if (i == 3) {
-            state.account = state.logged_in ? "Gemini" : "";
-            state.account_label = state.logged_in ? "Gemini" : "";
-            state.primary = "Pro: unknown";
-            state.secondary = "Flash: unknown";
-            state.primary_row = "5 hour";
-            state.secondary_row = "Weekly";
+        } else if (state.logged_in) {
+            state.account = provider_label(i);
+            state.account_label = provider_label(i);
         }
+    }
+    if (!g_app.enabled[g_app.selected]) {
+        for (int i = 0; i < kProviderCount; ++i) if (g_app.enabled[i]) { g_app.selected = i; break; }
     }
 }
 
@@ -1403,7 +1418,7 @@ int main(int argc, char** argv) {
     }
     SDL_SetAppMetadata("LLM Usage Tray", LLM_USAGE_TRAY_VERSION, "works.tward.llm-usage-tray");
 
-    g_ui.window = SDL_CreateWindow("LLM Usage Tray", kPanelWidth, kPanelCollapsedHeight,
+    g_ui.window = SDL_CreateWindow("LLM Usage Tray", kPanelWidth, 280,
         SDL_WINDOW_HIDDEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP |
         SDL_WINDOW_TRANSPARENT | SDL_WINDOW_UTILITY | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_ui.window) return 1;
@@ -1435,8 +1450,6 @@ int main(int argc, char** argv) {
             else if (event.type == SDL_EVENT_MOUSE_MOTION) handle_mouse_motion();
             else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) handle_mouse_up(logical_coordinate(event.button.x), logical_coordinate(event.button.y));
             else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
-                g_ui.provider_menu_open = false;
-                g_ui.provider_menu_tab = -1;
 #if defined(__linux__)
                 if (now_ms() - g_ui.shown_at_ms > 250) hide_panel();
 #else
@@ -1447,9 +1460,10 @@ int main(int argc, char** argv) {
             else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.api_key_mode && g_ui.api_input_focused) g_ui.api_key_input += event.text.text;
             else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.oauth_code_mode && g_ui.oauth_code_input_focused) g_ui.oauth_code_input += event.text.text;
             else if (event.type == SDL_EVENT_KEY_DOWN) {
-                if (event.key.key == SDLK_ESCAPE && g_ui.provider_menu_open) {
-                    g_ui.provider_menu_open = false;
-                    g_ui.provider_menu_tab = -1;
+                if (event.key.key == SDLK_ESCAPE && g_ui.settings_open && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
+                    g_ui.settings_open = false;
+                    g_ui.callout_open = true;
+                    set_target_height(wanted_panel_height());
                 } else if (g_ui.api_key_mode || g_ui.oauth_code_mode) {
                     bool oauth_code = g_ui.oauth_code_mode;
                     bool paste = ((event.key.mod & SDL_KMOD_CTRL) && event.key.key == SDLK_V) ||
