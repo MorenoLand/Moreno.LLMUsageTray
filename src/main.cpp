@@ -475,11 +475,7 @@ int enabled_count() {
 }
 
 int dock_height() {
-    int n = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_app.mutex);
-        n = enabled_count();
-    }
+    int n = enabled_count();
     if (n < 1) n = 1;
     return kDockPad + n * kRingSlot + kDockFooter;
 }
