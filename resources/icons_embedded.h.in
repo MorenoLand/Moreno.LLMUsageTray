@@ -1,0 +1,15 @@
+#pragma once
+
+#include <string_view>
+
+namespace embedded_icons {
+
+struct Icon {
+    const char* name;
+    std::string_view svg;
+};
+
+inline constexpr Icon kIcons[] = {
+@LLM_USAGE_TRAY_ICON_ENTRIES@};
+
+}

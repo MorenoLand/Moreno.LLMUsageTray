@@ -3,22 +3,15 @@
 #include "nanosvg.h"
 #include "nanosvgrast.h"
 
+#include "icons_embedded.h"
 #include "svg_icons.h"
 
 #include <SDL3/SDL.h>
 
 #include <algorithm>
 #include <cstring>
-#include <fstream>
 #include <string>
 #include <vector>
-
-#if defined(_WIN32)
-#include <windows.h>
-#ifdef small
-#undef small
-#endif
-#endif
 
 struct IconSet {
     SDL_Renderer* renderer = nullptr;
@@ -35,46 +28,10 @@ static IconSet* current_set() {
     return nullptr;
 }
 
-static std::string read_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return {};
-    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-}
-
-static std::string exe_dir() {
-#if defined(_WIN32)
-    wchar_t wbuf[MAX_PATH]{};
-    DWORD n = GetModuleFileNameW(nullptr, wbuf, MAX_PATH);
-    if (!n) return {};
-    std::string path;
-    int bytes = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)n, nullptr, 0, nullptr, nullptr);
-    path.resize(bytes);
-    WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)n, path.data(), bytes, nullptr, nullptr);
-    auto slash = path.find_last_of("\\/");
-    return slash == std::string::npos ? path : path.substr(0, slash);
-#else
-    const char* base = SDL_GetBasePath();
-    return base ? std::string(base) : std::string();
-#endif
-}
-
 static std::string find_svg(const char* name) {
-    std::string exe = exe_dir();
-    const char* bases[] = { "", "icons/", "resources/icons/" };
-    std::string candidates[] = {
-        exe + "/icons/" + name,
-        exe + "\\icons\\" + name,
-        exe + "/../Resources/icons/" + name,
-        exe + "/../../Resources/icons/" + name,
-        std::string("icons/") + name,
-        std::string("resources/icons/") + name,
-        std::string("G:/Development/c++/LLMUsageTray/resources/icons/") + name,
-    };
-    for (const auto& path : candidates) {
-        std::string body = read_file(path);
-        if (!body.empty() && body.find("<svg") != std::string::npos) return body;
+    for (const auto& icon : embedded_icons::kIcons) {
+        if (std::strcmp(icon.name, name) == 0) return std::string(icon.svg);
     }
-    (void)bases;
     return {};
 }
 

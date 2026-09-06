@@ -8,6 +8,19 @@ project(LLMUsageTray VERSION ${LLM_USAGE_TRAY_VERSION} LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+file(GLOB LLM_USAGE_TRAY_ICON_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons/*.svg")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(LLM_USAGE_TRAY_ICON_ENTRIES "")
+foreach(LLM_USAGE_TRAY_ICON_FILE IN LISTS LLM_USAGE_TRAY_ICON_FILES)
+    get_filename_component(LLM_USAGE_TRAY_ICON_NAME "${LLM_USAGE_TRAY_ICON_FILE}" NAME)
+    file(READ "${LLM_USAGE_TRAY_ICON_FILE}" LLM_USAGE_TRAY_ICON_SVG)
+    string(APPEND LLM_USAGE_TRAY_ICON_ENTRIES "    {\"${LLM_USAGE_TRAY_ICON_NAME}\", R\"LLM_ICON(\n${LLM_USAGE_TRAY_ICON_SVG}\n)LLM_ICON\"},\n")
+endforeach()
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons_embedded.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/icons_embedded.h"
+    @ONLY)
+
 include(FetchContent)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
@@ -33,6 +46,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(SDL_ttf)
 
 set(LLM_USAGE_TRAY_SOURCES
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/icons_embedded.h"
     src/main.cpp
     src/base64url.cpp
     src/diagnostics.cpp
@@ -78,7 +92,7 @@ else()
     add_executable(LLMUsageTray ${LLM_USAGE_TRAY_SOURCES})
 endif()
 
-target_include_directories(LLMUsageTray PRIVATE src)
+target_include_directories(LLMUsageTray PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_definitions(LLMUsageTray PRIVATE LLM_USAGE_TRAY_VERSION="${PROJECT_VERSION}")
 target_link_libraries(LLMUsageTray PRIVATE SDL3::SDL3 SDL3_ttf::SDL3_ttf)
 
@@ -97,18 +111,6 @@ if(WIN32)
     )
 else()
     target_link_libraries(LLMUsageTray PRIVATE CURL::libcurl)
-endif()
-
-if(APPLE)
-    add_custom_command(TARGET LLMUsageTray POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons"
-            "$<TARGET_BUNDLE_DIR:LLMUsageTray>/Contents/Resources/icons")
-else()
-    add_custom_command(TARGET LLMUsageTray POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons"
-            "$<TARGET_FILE_DIR:LLMUsageTray>/icons")
 endif()
 
 if(APPLE)
