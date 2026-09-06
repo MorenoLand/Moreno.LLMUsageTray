@@ -67,9 +67,10 @@ constexpr int kCalloutHeight = 168;
 constexpr int kCalloutSingleRowHeight = 112;
 constexpr int kSettingsRowHeight = 52;
 constexpr int kSettingsHeader = 48;
-constexpr int kSettingsExtra = 112;
+constexpr int kSettingsExtra = 156;
 constexpr int kSettingsFooter = 56;
 constexpr int kDefaultRefreshIntervalSeconds = 300;
+constexpr float kDefaultUiScale = 1.0f;
 constexpr int kKindCount = 5;
 constexpr int kMaxSlots = 10;
 constexpr int kProviderCount = kMaxSlots;
@@ -195,6 +196,7 @@ struct UiState {
     Rect settings_add_kind[kKindCount];
     Rect settings_quit, settings_refresh, settings_fill_toggle;
     Rect settings_refresh_interval;
+    Rect settings_scale;
     bool confirm_open = false;
     int confirm_index = -1;
     Rect confirm_cancel, confirm_delete;
@@ -202,11 +204,13 @@ struct UiState {
     Rect oauth_code_input_box, oauth_code_ok, oauth_code_cancel;
     float used_anim[kProviderCount]{};
     float hover_anim[kProviderCount]{};
+    float reorder_anim[kProviderCount]{};
     float gear_hot = 0;
     float pin_hot = 0;
     float left_anim = 0;
     float card_y_anim = 0;
     float draw_opacity = 1.0f;
+    float ui_scale = kDefaultUiScale;
     int hover_ring = -1;
     bool gear_hovered = false;
     bool pin_hovered = false;
@@ -228,6 +232,8 @@ std::atomic_bool g_show_requested{false};
 std::atomic_bool g_refresh_requested{false};
 std::atomic_bool g_warm_requested{false};
 
+constexpr float kUiScaleOptions[] = {0.75f, 0.85f, 1.0f, 1.15f, 1.3f, 1.5f};
+
 int layout_width() {
     return std::max(kDockWidth, g_ui.layout_w);
 }
@@ -236,12 +242,12 @@ int panel_height_px() { return static_cast<int>(std::round(g_ui.panel_height * g
 
 float window_panel_scale() {
 #if defined(__APPLE__)
-    return 1.0f;
+    return g_ui.ui_scale;
 #else
     SDL_Rect bounds{};
     SDL_DisplayID display = SDL_GetDisplayForWindow(g_ui.window);
     float resolution_scale = display && SDL_GetDisplayBounds(display, &bounds) ? std::clamp(static_cast<float>(bounds.h) / 1440.0f, 1.0f, 1.5f) : 1.0f;
-    return std::max(SDL_GetWindowDisplayScale(g_ui.window), resolution_scale);
+    return std::max(SDL_GetWindowDisplayScale(g_ui.window), resolution_scale) * g_ui.ui_scale;
 #endif
 }
 
@@ -271,6 +277,21 @@ float approach(float value, float target, float dt, float rate = 14.0f) {
 long long now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+bool valid_ui_scale(float value) {
+    for (float option : kUiScaleOptions) if (std::abs(value - option) < 0.001f) return true;
+    return false;
+}
+
+float next_ui_scale(float current) {
+    constexpr int count = static_cast<int>(sizeof(kUiScaleOptions) / sizeof(kUiScaleOptions[0]));
+    for (int i = 0; i < count; ++i) if (std::abs(current - kUiScaleOptions[i]) < 0.001f) return kUiScaleOptions[(i + 1) % count];
+    return kDefaultUiScale;
+}
+
+std::string ui_scale_label(float value) {
+    return std::to_string(static_cast<int>(std::lround(value * 100.0f))) + "%";
 }
 
 int kind_of(int slot) {
@@ -625,7 +646,7 @@ bool over_click_target(float x, float y) {
         for (int i = 0; i < kProviderCount; ++i) {
             if (contains(g_ui.settings_toggle[i], x, y) || contains(g_ui.settings_action[i], x, y)) return true;
         }
-        return contains(g_ui.settings_quit, x, y) || contains(g_ui.settings_refresh, x, y) || contains(g_ui.settings_fill_toggle, x, y) || contains(g_ui.settings_refresh_interval, x, y) || contains(g_ui.callout_rect, x, y);
+        return contains(g_ui.settings_quit, x, y) || contains(g_ui.settings_refresh, x, y) || contains(g_ui.settings_fill_toggle, x, y) || contains(g_ui.settings_refresh_interval, x, y) || contains(g_ui.settings_scale, x, y) || contains(g_ui.callout_rect, x, y);
     }
     return false;
 }
@@ -883,6 +904,17 @@ void apply_layout() {
     if (g_ui.visible) draw_panel();
 }
 
+void apply_ui_scale() {
+    if (!g_ui.window) return;
+    float next = window_panel_scale();
+    if (std::abs(next - g_ui.panel_scale) < 0.001f) return;
+    capture_pinned_card_positions();
+    g_ui.panel_scale = next;
+    preserve_pinned_card_positions();
+    set_target_height(wanted_panel_height(), true);
+    apply_layout();
+}
+
 void close_menus() {
     request_settings(false);
     g_ui.confirm_open = false;
@@ -1002,6 +1034,7 @@ void tick_ui(float dt) {
         g_ui.used_anim[i] = approach(g_ui.used_anim[i], static_cast<float>(used[i]), dt, 10.0f);
         g_ui.hover_anim[i] = approach(g_ui.hover_anim[i], g_ui.hover_ring == i ? 1.0f : 0.0f, dt, 16.0f);
         g_ui.slot_anim[i] = approach(g_ui.slot_anim[i], shown[i] ? 1.0f : 0.0f, dt, 14.0f);
+        g_ui.reorder_anim[i] = approach(g_ui.reorder_anim[i], g_ui.reorder_slot == i ? 1.0f : 0.0f, dt, 18.0f);
     }
     g_ui.gear_hot = approach(g_ui.gear_hot, g_ui.gear_hovered ? 1.0f : 0.0f, dt, 16.0f);
     g_ui.pin_hot = approach(g_ui.pin_hot, (g_ui.pin_hovered || g_ui.pinned) ? 1.0f : 0.0f, dt, 16.0f);
@@ -1781,6 +1814,7 @@ void draw_panel() {
     g_ui.callout_pin_button = {};
     g_ui.settings_fill_toggle = {};
     g_ui.settings_refresh_interval = {};
+    g_ui.settings_scale = {};
     for (int i = 0; i < kProviderCount; ++i) {
         g_ui.model_callout_rect[i] = {};
         g_ui.model_pin_button[i] = {};
@@ -1789,10 +1823,12 @@ void draw_panel() {
     for (int slot = 0; slot < kProviderCount; ++slot) g_ui.ring_slots[slot] = {};
     for (int n = 0; n < visible; ++n) {
         int i = visible_index[n];
-        float cy = dy + static_cast<float>(kDockPad + n * kRingSlot + kRingSize * 0.5f);
+        float base_cy = dy + static_cast<float>(kDockPad + n * kRingSlot + kRingSize * 0.5f);
+        float pickup = std::clamp(g_ui.reorder_anim[i], 0.0f, 1.0f);
+        float cy = base_cy - 8.0f * pickup;
         float cx = dx + kDockWidth * 0.5f;
-        g_ui.ring_slots[i] = {dx + 6, cy - 30, static_cast<float>(kDockWidth) - 12, 68};
-        float pop = 1.0f + 0.08f * g_ui.hover_anim[i];
+        g_ui.ring_slots[i] = {dx + 6, base_cy - 30, static_cast<float>(kDockWidth) - 12, 68};
+        float pop = 1.0f + 0.08f * g_ui.hover_anim[i] + 0.12f * pickup;
         SDL_Color accent = provider_accent(i);
         if (g_ui.hover_anim[i] > 0.01f) {
             accent.r = static_cast<Uint8>(std::min(255.0f, accent.r + 28 * g_ui.hover_anim[i]));
@@ -1878,7 +1914,11 @@ void draw_panel() {
                 text(card_x + 18, interval_y + 8, "Refresh interval", 245, 245, 247, true, true);
                 g_ui.settings_refresh_interval = {card_x + 210, interval_y + 4, 100, 30};
                 button(g_ui.settings_refresh_interval, refresh_interval_label(g_ui.refresh_interval_seconds), true);
-                float add_y = fill_y + 84;
+                float scale_y = fill_y + 84;
+                text(card_x + 18, scale_y + 8, "UI scale", 245, 245, 247, true, true);
+                g_ui.settings_scale = {card_x + 210, scale_y + 4, 100, 30};
+                button(g_ui.settings_scale, ui_scale_label(g_ui.ui_scale), true);
+                float add_y = fill_y + 128;
                 int hidden_n = 0;
                 for (int k = 0; k < kKindCount; ++k) {
                     if (g_app.listed[k]) continue;
@@ -2198,6 +2238,7 @@ void save_layout() {
     }
     json += ",\"remain\":" + std::string(g_ui.show_remaining ? "1" : "0");
     json += ",\"refresh_seconds\":" + std::to_string(g_ui.refresh_interval_seconds);
+    json += ",\"ui_scale\":" + std::to_string(g_ui.ui_scale);
     json += "}";
     try { credential_save_named("layout", json); } catch (const std::exception&) { }
 }
@@ -2383,6 +2424,12 @@ void handle_click(float x, float y) {
             save_layout();
             return;
         }
+        if (contains(g_ui.settings_scale, x, y)) {
+            g_ui.ui_scale = next_ui_scale(g_ui.ui_scale);
+            save_layout();
+            apply_ui_scale();
+            return;
+        }
         for (int k = 0; k < kKindCount; ++k) {
             if (contains(g_ui.settings_add_kind[k], x, y)) {
                 g_app.listed[k] = true;
@@ -2522,6 +2569,7 @@ void handle_mouse_motion() {
             int index = g_ui.reorder_slot >= 0 ? g_ui.reorder_slot : g_ui.pending_ring;
             g_ui.pending_ring = -1;
             g_ui.reorder_slot = index;
+            g_ui.reorder_anim[index] = 1.0f;
             int over = slot_at_dock_y(ly);
             if (over >= 0 && over != index) {
                 swap_dock_order(index, over);
@@ -2579,6 +2627,8 @@ void handle_mouse_motion() {
 
 void handle_mouse_up(float x, float y) {
     if (g_ui.reorder_slot >= 0) {
+        int index = g_ui.reorder_slot;
+        g_ui.reorder_anim[index] = 1.0f;
         g_ui.reorder_slot = -1;
         g_ui.pending_ring = -1;
         apply_layout();
@@ -2621,6 +2671,10 @@ void load_layout() {
     } else if (auto refresh = json_number(*raw, "refresh")) {
         int value = static_cast<int>(*refresh) * 60;
         if (valid_refresh_interval(value)) g_ui.refresh_interval_seconds = value;
+    }
+    if (auto scale = json_number(*raw, "ui_scale")) {
+        float value = static_cast<float>(*scale);
+        if (valid_ui_scale(value)) g_ui.ui_scale = value;
     }
     std::lock_guard<std::mutex> lock(g_app.mutex);
     for (int i = 0; i < kKindCount; ++i) {
@@ -2745,6 +2799,7 @@ int main(int argc, char** argv) {
 #endif
     g_ui.renderer = SDL_CreateRenderer(g_ui.window, nullptr);
     if (!g_ui.renderer) return 1;
+    init_state();
     g_ui.premul = SDL_ComposeCustomBlendMode(
         SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD,
         SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD);
@@ -2758,7 +2813,6 @@ int main(int argc, char** argv) {
     if (!init_fonts()) return 1;
     icons_load(g_ui.renderer);
 
-    init_state();
     create_tray();
     for (int i = 0; i < kProviderCount; ++i) {
         if (provider_has_auth(i)) refresh_usage_async_for(i, true);
